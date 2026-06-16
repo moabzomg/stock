@@ -1,0 +1,62 @@
+{
+  "NVDA": {
+    "buy_price": 211.4,
+    "qty": 0.006,
+    "buy_time": "2026-06-15T20:52:19.171754",
+    "score_at_buy": 6
+  },
+  "AAPL": {
+    "buy_price": 296.27,
+    "qty": 0.0043,
+    "buy_time": "2026-06-15T20:52:19.206645",
+    "score_at_buy": 6
+  },
+  "ANET": {
+    "buy_price": 167.67,
+    "qty": 0.0076,
+    "buy_time": "2026-06-15T20:52:19.238873",
+    "score_at_buy": 6
+  },
+  "PANW": {
+    "buy_price": 283.34,
+    "qty": 0.0045,
+    "buy_time": "2026-06-15T20:52:19.271609",
+    "score_at_buy": 6
+  },
+  "DDOG": {
+    "buy_price": 232.4,
+    "qty": 0.0055,
+    "buy_time": "2026-06-15T20:52:19.302328",
+    "score_at_buy": 6
+  },
+  "CRWD": {
+    "buy_price": 691.9,
+    "qty": 0.0018,
+    "buy_time": "2026-06-15T20:52:19.336129",
+    "score_at_buy": 6
+  },
+  "ROKU": {
+    "buy_price": 141.38,
+    "qty": 0.009,
+    "buy_time": "2026-06-15T20:52:19.367162",
+    "score_at_buy": 6
+  },
+  "TWLO": {
+    "buy_price": 203.53,
+    "qty": 0.0062,
+    "buy_time": "2026-06-15T20:52:19.400096",
+    "score_at_buy": 6
+  },
+  "ABNB": {
+    "buy_price": 138.1,
+    "qty": 0.0092,
+    "buy_time": "2026-06-15T20:52:19.434706",
+    "score_at_buy": 6
+  },
+  "F": {
+    "buy_price": 14.79,
+    "qty": 0.0859,
+    "buy_time": "2026-06-15T20:52:19.467414",
+    "score_at_buy": 6
+  }
+}

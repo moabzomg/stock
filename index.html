@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Stock Visualiser</title>
+<script src="https://code.highcharts.com/stock/highstock.js"></script>
+<script src="https://code.highcharts.com/stock/modules/drag-panes.js"></script>
+<script src="https://code.highcharts.com/stock/indicators/indicators.js"></script>
+<style>
+  body { background:#111; color:#eee; font-family:monospace; padding:20px; margin:0; }
+  select { background:#222; color:#eee; border:1px solid #555; padding:8px 12px; font-size:16px; border-radius:4px; min-width:300px; }
+  #error { color:tomato; margin-top:10px; }
+  #chart { margin-top:20px; }
+</style>
+</head>
+<body>
+<h2>Stock Visualiser</h2>
+<select id="symbol" onchange="load()">
+  <option value="">-- loading files... --</option>
+</select>
+<div id="error"></div>
+<div id="chart" style="height:600px"></div>
+
+<script>
+function parseCSV(text) {
+    const lines = text.trim().split('\n');
+    const headers = lines[0].split(',');
+    return lines.slice(1).map(line => {
+        const vals = line.split(',');
+        const obj = {};
+        headers.forEach((h, i) => obj[h.trim()] = vals[i] ? vals[i].trim() : '');
+        return obj;
+    });
+}
+
+function parseDate(d) {
+    if (d.length === 14)
+        return Date.UTC(+d.slice(0,4), +d.slice(4,6)-1, +d.slice(6,8), +d.slice(8,10), +d.slice(10,12), +d.slice(12,14));
+    return Date.UTC(+d.slice(0,4), +d.slice(4,6)-1, +d.slice(6,8));
+}
+
+async function init() {
+    const dirRes = await fetch('data/');
+    const doc = new DOMParser().parseFromString(await dirRes.text(), 'text/html');
+    const files = [...doc.querySelectorAll('a')]
+        .map(a => a.getAttribute('href'))
+        .filter(l => l && l.endsWith('.csv'));
+
+    const sel = document.getElementById('symbol');
+    sel.innerHTML = '<option value="">-- select a file --</option>';
+    files.forEach(f => {
+        const opt = document.createElement('option');
+        opt.value = f;
+        opt.text = f;
+        sel.appendChild(opt);
+    });
+}
+
+async function load() {
+    const file = document.getElementById('symbol').value;
+    if (!file) return;
+    document.getElementById('error').innerText = '';
+
+    const rows = parseCSV(await (await fetch(`data/${file}`)).text());
+
+    const ohlc   = rows.map(r => [parseDate(r.date), +r.open, +r.high, +r.low, +r.close]);
+    const volume = rows.map(r => [parseDate(r.date), +r.volume]);
+
+    Highcharts.stockChart('chart', {
+        chart: { backgroundColor: '#111' },
+        title: { text: file, style: { color: '#eee' } },
+        rangeSelector: { selected: 1, inputStyle: { color: '#eee' }, labelStyle: { color: '#eee' } },
+        navigator: { enabled: true },
+        scrollbar: { enabled: true },
+        xAxis: { gridLineColor: '#333' },
+        yAxis: [
+            { labels: { style: { color: '#eee' } }, gridLineColor: '#333', height: '70%' },
+            { labels: { style: { color: '#eee' } }, gridLineColor: '#333', top: '75%', height: '25%', offset: 0 }
+        ],
+        tooltip: { split: true },
+        series: [
+            { type: 'candlestick', name: file, data: ohlc, yAxis: 0,
+              upColor: '#26a69a', color: '#ef5350',
+              upLineColor: '#26a69a', lineColor: '#ef5350' },
+            { type: 'column', name: 'Volume', data: volume, yAxis: 1,
+              color: 'rgba(100,100,200,0.5)' }
+        ],
+        credits: { enabled: false }
+    });
+}
+
+init();
+</script>
+</body>
+</html>

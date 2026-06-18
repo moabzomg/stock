@@ -1,347 +1,396 @@
-#!/usr/bin/env python3
 """
-MA200 + MA500 Screener — All FX Pairs + Major Stocks
-=====================================================
-Connects to IBKR, fetches 3 years of daily bars for every
-instrument, computes MA200 + MA500, then shows the last 5
-days and a BUY/SELL/NEUTRAL signal for each.
+MA200 + MA500 Screener — Major Stocks + FX Pairs
+=================================================
+• Async API with hard per-request timeout (fixes Python 3.12 hang)
+• No qualifyContracts (was the original hang culprit)
+• FX uses BID bars (MIDPOINT needs paid subscription → Error 162)
+• BUY / SELL / NEUTRAL signal per instrument
+• Last 5 closes shown in terminal
+• Auto-saves timestamped CSV
 
 RUN:
   cd ~/Desktop/stock
   source venv/bin/activate
-  pip install ib_insync pandas plotly
-  python3 ma_screener.py
-
-NOTE: Takes 2-5 minutes — IBKR rate-limits historical requests.
+  pip install "ib_insync>=0.9.86" pandas
+  python3 ma200_ma500.py
 """
 
-from ib_insync import IB, Forex, Stock
-import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import time
+import asyncio, sys
 from datetime import datetime
+import pandas as pd
+from ib_insync import IB, Stock, Forex, util
 
-PORT      = 7496
-HOST      = '127.0.0.1'
-CLIENT_ID = 4
+util.logToConsole(False)   # silence ib_insync debug noise
 
-# ── Instruments ───────────────────────────────────────────────────────────────
-FX_PAIRS = [
-    ('GBP', 'HKD'), ('GBP', 'USD'), ('GBP', 'EUR'), ('GBP', 'JPY'),
-    ('GBP', 'AUD'), ('GBP', 'CAD'), ('GBP', 'CHF'), ('GBP', 'NZD'),
-    ('EUR', 'USD'), ('EUR', 'JPY'), ('EUR', 'CHF'), ('EUR', 'AUD'),
-    ('USD', 'JPY'), ('USD', 'CAD'), ('USD', 'CHF'), ('USD', 'HKD'),
-    ('AUD', 'USD'), ('NZD', 'USD'),
-]
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG — tweak these to your needs
+# ══════════════════════════════════════════════════════════════════════════════
 
+TWS_HOST        = "127.0.0.1"
+TWS_PORT        = 7497          # 7497 = TWS  |  4001 = IB Gateway
+CLIENT_ID       = 15
+REQUEST_TIMEOUT = 25            # seconds before skipping one instrument
+SLEEP_BETWEEN   = 1.5           # seconds between requests (IBKR pacing)
+HISTORY_PERIOD  = "3 Y"         # how far back to fetch
+
+# ── Major stocks ──────────────────────────────────────────────────────────────
+# (symbol, exchange, currency, friendly_name)
 STOCKS = [
-    # US Tech
-    ('AAPL',  'SMART', 'USD'),
-    ('MSFT',  'SMART', 'USD'),
-    ('NVDA',  'SMART', 'USD'),
-    ('GOOGL', 'SMART', 'USD'),
-    ('AMZN',  'SMART', 'USD'),
-    ('META',  'SMART', 'USD'),
-    ('TSLA',  'SMART', 'USD'),
-    # UK stocks (LSE)
-    ('SHEL',  'LSE',   'GBP'),
-    ('HSBA',  'LSE',   'GBP'),
-    ('BP',    'LSE',   'GBP'),
-    ('VOD',   'LSE',   'GBP'),
-    # HK stocks
-    ('0005',  'SEHK',  'HKD'),  # HSBC HK
-    ('0700',  'SEHK',  'HKD'),  # Tencent
-    ('0941',  'SEHK',  'HKD'),  # China Mobile
+    # ── US Mega-cap Tech ──────────────────────────────────────────────────────
+    ("AAPL",  "SMART", "USD", "Apple"),
+    ("MSFT",  "SMART", "USD", "Microsoft"),
+    ("GOOGL", "SMART", "USD", "Alphabet"),
+    ("AMZN",  "SMART", "USD", "Amazon"),
+    ("NVDA",  "SMART", "USD", "NVIDIA"),
+    ("META",  "SMART", "USD", "Meta"),
+    ("TSLA",  "SMART", "USD", "Tesla"),
+    ("AVGO",  "SMART", "USD", "Broadcom"),
+    ("ORCL",  "SMART", "USD", "Oracle"),
+    ("CSCO",  "SMART", "USD", "Cisco"),
+    # ── US Financials ─────────────────────────────────────────────────────────
+    ("JPM",   "SMART", "USD", "JPMorgan"),
+    ("BAC",   "SMART", "USD", "Bank of America"),
+    ("WFC",   "SMART", "USD", "Wells Fargo"),
+    ("GS",    "SMART", "USD", "Goldman Sachs"),
+    ("MS",    "SMART", "USD", "Morgan Stanley"),
+    ("V",     "SMART", "USD", "Visa"),
+    ("MA",    "SMART", "USD", "Mastercard"),
+    # ── US Healthcare ─────────────────────────────────────────────────────────
+    ("JNJ",   "SMART", "USD", "J&J"),
+    ("UNH",   "SMART", "USD", "UnitedHealth"),
+    ("LLY",   "SMART", "USD", "Eli Lilly"),
+    ("ABBV",  "SMART", "USD", "AbbVie"),
+    ("PFE",   "SMART", "USD", "Pfizer"),
+    ("MRK",   "SMART", "USD", "Merck"),
+    ("AZN",   "SMART", "USD", "AstraZeneca"),
+    # ── US Consumer / Retail ─────────────────────────────────────────────────
+    ("AMZN",  "SMART", "USD", "Amazon"),
+    ("WMT",   "SMART", "USD", "Walmart"),
+    ("COST",  "SMART", "USD", "Costco"),
+    ("MCD",   "SMART", "USD", "McDonald's"),
+    ("KO",    "SMART", "USD", "Coca-Cola"),
+    ("PEP",   "SMART", "USD", "PepsiCo"),
+    ("PG",    "SMART", "USD", "P&G"),
+    ("HD",    "SMART", "USD", "Home Depot"),
+    # ── US Energy ────────────────────────────────────────────────────────────
+    ("XOM",   "SMART", "USD", "ExxonMobil"),
+    ("CVX",   "SMART", "USD", "Chevron"),
+    ("SHEL",  "SMART", "USD", "Shell"),
+    ("BP",    "SMART", "USD", "BP"),
+    # ── US Industrials ───────────────────────────────────────────────────────
+    ("CAT",   "SMART", "USD", "Caterpillar"),
+    ("BA",    "SMART", "USD", "Boeing"),
+    ("GE",    "SMART", "USD", "GE"),
+    ("RTX",   "SMART", "USD", "RTX"),
+    # ── ETFs ─────────────────────────────────────────────────────────────────
+    ("SPY",   "SMART", "USD", "S&P 500 ETF"),
+    ("QQQ",   "SMART", "USD", "Nasdaq ETF"),
+    ("IWM",   "SMART", "USD", "Russell 2000 ETF"),
+    ("DIA",   "SMART", "USD", "Dow ETF"),
+    ("GLD",   "SMART", "USD", "Gold ETF"),
 ]
 
-# ── Connect ───────────────────────────────────────────────────────────────────
-print("\n" + "="*65)
-print("  MA200 + MA500 Screener — FX + Stocks")
-print("="*65)
-print(f"\n⏳ Connecting to TWS on {HOST}:{PORT}...")
+# Deduplicate by symbol (AMZN appears twice above as example)
+seen = set()
+STOCKS = [s for s in STOCKS if not (s[0] in seen or seen.add(s[0]))]
 
-ib = IB()
-try:
-    ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=10)
-    print("✅ Connected!\n")
-except Exception as e:
-    print(f"❌ Connection failed: {e}")
-    exit(1)
+# ── FX Pairs ─────────────────────────────────────────────────────────────────
+FX_PAIRS = [
+    ("EUR", "USD"), ("GBP", "USD"), ("USD", "JPY"),
+    ("USD", "CHF"), ("AUD", "USD"), ("USD", "CAD"),
+    ("NZD", "USD"), ("EUR", "GBP"), ("EUR", "JPY"),
+    ("GBP", "JPY"),
+]
 
-# ── Helper: compute MAs and return last 5 rows ────────────────────────────────
-def compute_mas(bars, name):
-    if len(bars) < 200:
-        return None, f"⚠️  Only {len(bars)} bars — need 200+ for MA200"
+# ══════════════════════════════════════════════════════════════════════════════
+# TERMINAL COLOURS
+# ══════════════════════════════════════════════════════════════════════════════
 
-    df = pd.DataFrame([{
-        'date'  : pd.to_datetime(str(b.date)),
-        'open'  : b.open,
-        'high'  : b.high,
-        'low'   : b.low,
-        'close' : b.close,
-    } for b in bars])
-    df.set_index('date', inplace=True)
-    df.sort_index(inplace=True)
+RS="\033[0m"; BOLD="\033[1m"; DIM="\033[2m"
+GRN="\033[92m"; RED="\033[91m"; YLW="\033[93m"; CYN="\033[96m"; WHT="\033[97m"
 
-    df['ma200'] = df['close'].rolling(200).mean()
-    df['ma500'] = df['close'].rolling(500).mean() if len(df) >= 500 else float('nan')
+def c(text, *codes): return "".join(codes)+str(text)+RS
 
-    # Signal based on latest values
-    latest = df.iloc[-1]
-    price  = latest['close']
-    ma200  = latest['ma200']
-    ma500  = latest['ma500']
+def signal_badge(sig):
+    return {
+        "BUY":     c(f" ▲ BUY     ", GRN, BOLD),
+        "SELL":    c(f" ▼ SELL    ", RED, BOLD),
+        "NEUTRAL": c(f" ● NEUTRAL ", YLW),
+        "N/A":     c(f"   N/A     ", DIM),
+    }.get(sig, sig)
 
-    if pd.isna(ma500):
-        if price > ma200:
-            signal = '🟢 ABOVE MA200'
-        else:
-            signal = '🔴 BELOW MA200'
-        note = '(MA500 needs 500+ days)'
-    else:
-        if price > ma200 and price > ma500 and ma200 > ma500:
-            signal = '🟢 STRONG BUY'
-        elif price > ma200 and price > ma500:
-            signal = '🟢 BUY'
-        elif price < ma200 and price < ma500 and ma200 < ma500:
-            signal = '🔴 STRONG SELL'
-        elif price < ma200 and price < ma500:
-            signal = '🔴 SELL'
-        else:
-            signal = '🟡 NEUTRAL'
-        note = ''
+def bar(pct, width=20):
+    """Simple ASCII progress bar."""
+    filled = int(width * pct)
+    return c("█" * filled, CYN) + c("░" * (width - filled), DIM)
 
-    return df, signal, note
+# ══════════════════════════════════════════════════════════════════════════════
+# MA LOGIC
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Fetch all instruments ─────────────────────────────────────────────────────
-results   = []  # summary rows
-all_dfs   = {}  # name -> full df for charting
+def add_mas(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["ma200"] = df["close"].rolling(200, min_periods=200).mean()
+    df["ma500"] = df["close"].rolling(500, min_periods=500).mean()
+    return df
 
-total = len(FX_PAIRS) + len(STOCKS)
-count = 0
+def compute_signal(df: pd.DataFrame) -> str:
+    if df is None or len(df) < 200:
+        return "N/A"
+    df = add_mas(df)
+    row = df.iloc[-1]
+    p, m2, m5 = row["close"], row["ma200"], row["ma500"]
+    if pd.isna(m2):
+        return "N/A"
+    if pd.isna(m5):                         # only MA200 available
+        if p > m2: return "BUY"
+        if p < m2: return "SELL"
+        return "NEUTRAL"
+    # Both MAs available — trend-aligned signal
+    if p > m2 and m2 > m5: return "BUY"
+    if p < m2 and m2 < m5: return "SELL"
+    return "NEUTRAL"
 
-# FX
-print("📥 Fetching FX pairs...")
-for base, quote in FX_PAIRS:
-    name = f"{base}/{quote}"
-    count += 1
-    print(f"  [{count}/{total}] {name}...", end=' ', flush=True)
-
-    try:
-        contract = Forex(base + quote)
-        ib.qualifyContracts(contract)
-
-        bars = ib.reqHistoricalData(
-            contract,
-            endDateTime='',
-            durationStr='3 Y',
-            barSizeSetting='1 day',
-            whatToShow='MIDPOINT',
-            useRTH=False,
-            formatDate=1,
-        )
-        time.sleep(0.5)  # respect IBKR rate limit
-
-        if not bars:
-            print("no data")
-            continue
-
-        result = compute_mas(bars, name)
-        df     = result[0]
-        signal = result[1]
-        note   = result[2] if len(result) > 2 else ''
-
-        if df is None:
-            print(signal)
-            continue
-
-        last5  = df.tail(5)
-        latest = df.iloc[-1]
-
-        all_dfs[name] = df
-        results.append({
-            'name'    : name,
-            'type'    : 'FX',
-            'price'   : round(latest['close'], 5),
-            'ma200'   : round(latest['ma200'], 5),
-            'ma500'   : round(latest['ma500'], 5) if not pd.isna(latest['ma500']) else 'N/A',
-            'vs_ma200': round((latest['close'] / latest['ma200'] - 1) * 100, 2),
-            'signal'  : signal,
-            'bars'    : len(bars),
-        })
-        print(f"✅ {signal}")
-
-    except Exception as e:
-        print(f"❌ {e}")
-
-# Stocks
-print("\n📥 Fetching stocks...")
-for ticker, exchange, currency in STOCKS:
-    name = f"{ticker}"
-    count += 1
-    print(f"  [{count}/{total}] {name}...", end=' ', flush=True)
-
-    try:
-        contract = Stock(ticker, exchange, currency)
-        ib.qualifyContracts(contract)
-
-        bars = ib.reqHistoricalData(
-            contract,
-            endDateTime='',
-            durationStr='3 Y',
-            barSizeSetting='1 day',
-            whatToShow='TRADES',
-            useRTH=True,
-            formatDate=1,
-        )
-        time.sleep(0.5)
-
-        if not bars:
-            print("no data")
-            continue
-
-        result = compute_mas(bars, name)
-        df     = result[0]
-        signal = result[1]
-        note   = result[2] if len(result) > 2 else ''
-
-        if df is None:
-            print(signal)
-            continue
-
-        latest = df.iloc[-1]
-        all_dfs[name] = df
-        results.append({
-            'name'    : name,
-            'type'    : 'Stock',
-            'price'   : round(latest['close'], 3),
-            'ma200'   : round(latest['ma200'], 3),
-            'ma500'   : round(latest['ma500'], 3) if not pd.isna(latest['ma500']) else 'N/A',
-            'vs_ma200': round((latest['close'] / latest['ma200'] - 1) * 100, 2),
-            'signal'  : signal,
-            'bars'    : len(bars),
-        })
-        print(f"✅ {signal}")
-
-    except Exception as e:
-        print(f"❌ {e}")
-
-ib.disconnect()
-print("\n🔌 Disconnected from TWS\n")
-
-if not results:
-    print("❌ No data collected. Check TWS connection.")
-    exit(1)
-
-# ── Print last 5 days table per instrument ────────────────────────────────────
-print("\n" + "="*65)
-print("  LAST 5 DAYS — MA200 + MA500 for each instrument")
-print("="*65)
-
-for name, df in all_dfs.items():
-    last5 = df.tail(5)[['close','ma200','ma500']].copy()
-    last5.columns = ['Close', 'MA200', 'MA500']
-    last5 = last5.round(5)
-    sig = next((r['signal'] for r in results if r['name'] == name), '')
-    print(f"\n  {name}  {sig}")
-    print(last5.to_string())
-
-# ── Summary ranking table ─────────────────────────────────────────────────────
-summary = pd.DataFrame(results)
-summary_sorted = summary.sort_values('vs_ma200', ascending=False)
-
-print("\n\n" + "="*80)
-print("  RANKING — Price vs MA200 (strongest to weakest)")
-print("="*80)
-print(f"  {'Name':<12} {'Type':<7} {'Price':>10} {'MA200':>10} {'MA500':>10} {'%vMA200':>8}  Signal")
-print(f"  {'─'*75}")
-for _, row in summary_sorted.iterrows():
-    print(f"  {row['name']:<12} {row['type']:<7} {row['price']:>10} "
-          f"{row['ma200']:>10} {str(row['ma500']):>10} "
-          f"{row['vs_ma200']:>7.2f}%  {row['signal']}")
-
-# ── Save summary CSV ──────────────────────────────────────────────────────────
-ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
-csv_file = f"ma_screener_{ts}.csv"
-summary_sorted.to_csv(csv_file, index=False)
-print(f"\n💾 Summary saved: {csv_file}")
-
-# ── Build interactive chart ───────────────────────────────────────────────────
-print("📊 Building summary chart...")
-
-# Chart 1: % above/below MA200 bar chart
-names   = summary_sorted['name'].tolist()
-pcts    = summary_sorted['vs_ma200'].tolist()
-signals = summary_sorted['signal'].tolist()
-
-colors = []
-for s in signals:
-    if 'STRONG BUY' in s or 'ABOVE' in s:
-        colors.append('#26a69a')
-    elif 'BUY' in s:
-        colors.append('#66bb6a')
-    elif 'STRONG SELL' in s:
-        colors.append('#ef5350')
-    elif 'SELL' in s:
-        colors.append('#ff7043')
-    else:
-        colors.append('#f39c12')
-
-fig = make_subplots(
-    rows=2, cols=1,
-    row_heights=[0.65, 0.35],
-    vertical_spacing=0.08,
-    subplot_titles=(
-        '% Above / Below MA200  (green = above, red = below)',
-        'Price vs MA200 vs MA500 — select instrument above to highlight'
+def last5_str(df: pd.DataFrame) -> str:
+    if df is None or df.empty: return "—"
+    return "  ".join(
+        f"{r['date'].strftime('%m/%d')}:{r['close']:.2f}"
+        for _, r in df.tail(5).iterrows()
     )
-)
 
-fig.add_trace(go.Bar(
-    x=names, y=pcts,
-    marker_color=colors,
-    name='% vs MA200',
-    text=[f"{p:+.2f}%" for p in pcts],
-    textposition='outside',
-), row=1, col=1)
+def ma_values(df: pd.DataFrame):
+    """Return (price, ma200, ma500) as formatted strings."""
+    if df is None or df.empty:
+        return "—", "—", "—"
+    df = add_mas(df)
+    row = df.iloc[-1]
+    fmt = lambda v: f"{v:.4f}" if v < 100 else f"{v:.2f}"
+    p   = fmt(row["close"])
+    m2  = fmt(row["ma200"]) if not pd.isna(row["ma200"]) else "—"
+    m5  = fmt(row["ma500"]) if not pd.isna(row["ma500"]) else "<500bars"
+    return p, m2, m5
 
-fig.add_hline(y=0, line_color='white', line_width=1,
-              opacity=0.4, row=1, col=1)
+# ══════════════════════════════════════════════════════════════════════════════
+# ASYNC FETCH  — asyncio.wait_for gives TRUE hard timeout (fixes Python 3.12)
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Price chart for first instrument (GBP/HKD or first available)
-first_name = 'GBP/HKD' if 'GBP/HKD' in all_dfs else list(all_dfs.keys())[0]
-df_plot = all_dfs[first_name].tail(250)  # last 250 days
+async def fetch_bars(ib: IB, contract, what: str, label: str) -> pd.DataFrame | None:
+    """
+    Fetch daily bars with a hard timeout and automatic retry on pacing.
+    For FX:   whatToShow="BID"  (MIDPOINT → Error 162 without subscription)
+    For STK:  whatToShow="ADJUSTED_LAST"
+    """
+    what_list = [what]
+    if getattr(contract, "secType", "") == "CASH":
+        what_list = ["BID", "ASK"]      # try BID first, fall back to ASK
 
-fig.add_trace(go.Scatter(
-    x=df_plot.index, y=df_plot['close'],
-    name='Price', line=dict(color='#d1d4dc', width=1.5)
-), row=2, col=1)
+    for w in what_list:
+        for attempt in range(2):
+            try:
+                coro = ib.reqHistoricalDataAsync(
+                    contract,
+                    endDateTime="",
+                    durationStr=HISTORY_PERIOD,
+                    barSizeSetting="1 day",
+                    whatToShow=w,
+                    useRTH=True,
+                    formatDate=1,
+                    keepUpToDate=False,
+                )
+                bars = await asyncio.wait_for(coro, timeout=REQUEST_TIMEOUT)
+                if bars:
+                    df = util.df(bars)
+                    df["date"] = pd.to_datetime(df["date"])
+                    return df[["date","open","high","low","close","volume"]].reset_index(drop=True)
+                break   # empty result, try next whatToShow
 
-fig.add_trace(go.Scatter(
-    x=df_plot.index, y=df_plot['ma200'],
-    name='MA200', line=dict(color='#f39c12', width=2)
-), row=2, col=1)
+            except asyncio.TimeoutError:
+                print(c(f"⏱ ", YLW), end="", flush=True)
+                break   # don't retry on timeout
 
-if not df_plot['ma500'].isna().all():
-    fig.add_trace(go.Scatter(
-        x=df_plot.index, y=df_plot['ma500'],
-        name='MA500', line=dict(color='#3498db', width=2)
-    ), row=2, col=1)
+            except Exception as exc:
+                err = str(exc).lower()
+                if "pacing" in err:
+                    wait = 65 * (attempt + 1)
+                    print(c(f"\n   ⏳ Pacing ({label}) — sleep {wait}s…", YLW))
+                    await asyncio.sleep(wait)
+                elif "162" in str(exc) or "cancelled" in err:
+                    break   # Error 162: subscription missing, try next whatToShow
+                else:
+                    print(c(f" ERR ", RED), end="", flush=True)
+                    return None
 
-fig.update_layout(
-    title=f"MA200 + MA500 Screener — {len(results)} instruments — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-    template='plotly_dark',
-    paper_bgcolor='#131722',
-    plot_bgcolor='#131722',
-    font=dict(color='#d1d4dc', size=11),
-    height=800,
-    margin=dict(l=60, r=60, t=80, b=60),
-)
-fig.update_xaxes(gridcolor='#2a2e39')
-fig.update_yaxes(gridcolor='#2a2e39')
+    return None
 
-chart_file = f"ma_screener_chart_{ts}.html"
-fig.write_html(chart_file, auto_open=True)
-print(f"✅ Chart opened: {chart_file}\n")
-print("="*65 + "\n")
+# ══════════════════════════════════════════════════════════════════════════════
+# PRINT HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def print_header():
+    print()
+    print(c("╔" + "═"*66 + "╗", CYN))
+    print(c("║", CYN) + c("  MA200 + MA500 SCREENER  —  Major Stocks + FX Pairs".center(66), BOLD+WHT) + c("║", CYN))
+    print(c("║", CYN) + c(f"  {datetime.now():%A %d %B %Y  %H:%M:%S}".center(66), DIM) + c("║", CYN))
+    print(c("╚" + "═"*66 + "╝", CYN))
+
+def print_section(title, subtitle=""):
+    print()
+    print(c(f"  ┌─ {title} " + ("─"*(60-len(title))), CYN))
+    if subtitle:
+        print(c(f"  │  {subtitle}", DIM))
+    print(c("  └" + "─"*65, CYN))
+
+def print_row(idx, total, name, label, price, ma200, ma500, signal, extra=""):
+    pct  = idx / total
+    prog = bar(pct, width=6)
+    sig  = signal_badge(signal)
+    name_col = c(f"{name:<20}", WHT)
+    vals = c(f"P:{price:<10} MA200:{ma200:<10} MA500:{ma500}", DIM)
+    print(f"  {prog} [{idx:02d}/{total}] {sig} {name_col}  {vals}{extra}")
+
+def print_results_table(results: list[dict]):
+    print()
+    print(c("╔" + "═"*66 + "╗", CYN))
+    print(c("║", CYN) + c("  FINAL RESULTS".center(66), BOLD+WHT) + c("║", CYN))
+    print(c("╠" + "═"*66 + "╣", CYN))
+
+    for sig_label, icon in [("BUY","▲"), ("SELL","▼"), ("NEUTRAL","●"), ("N/A","○")]:
+        group = [r for r in results if r["signal"] == sig_label]
+        if not group:
+            continue
+
+        badge = signal_badge(sig_label)
+        print(c("║", CYN) + f"  {badge}  {len(group):>2} instruments".ljust(64) + c("║", CYN))
+        print(c("╠" + "─"*66 + "╣", CYN))
+
+        for r in group:
+            tag  = c(f"[{r['type']:3s}]", DIM)
+            name = f"{r['instrument']:<10}  {r['name']:<22}"
+            p, m2, m5 = r["price"], r["ma200"], r["ma500"]
+            vals = c(f"P:{p}  MA200:{m2}  MA500:{m5}", DIM)
+            line = f"   {tag} {name} {vals}"
+            # pad/truncate to fit column width
+            visible_len = len(f"   [{r['type']:3s}] {r['instrument']:<10}  {r['name']:<22} P:{p}  MA200:{m2}  MA500:{m5}")
+            pad = max(0, 65 - visible_len)
+            print(c("║", CYN) + line + " "*pad + c("║", CYN))
+
+        print(c("╠" + "═"*66 + "╣", CYN))
+
+    # Counts summary
+    buys  = sum(1 for r in results if r["signal"]=="BUY")
+    sells = sum(1 for r in results if r["signal"]=="SELL")
+    neut  = sum(1 for r in results if r["signal"]=="NEUTRAL")
+    na    = sum(1 for r in results if r["signal"]=="N/A")
+    summary = (c(f" ▲{buys} BUY", GRN) + "  " +
+               c(f"▼{sells} SELL", RED) + "  " +
+               c(f"●{neut} NEUTRAL", YLW) + "  " +
+               c(f"○{na} N/A", DIM))
+    print(c("║", CYN) + f"  {summary}".ljust(80) + c("║", CYN))
+    print(c("╚" + "═"*66 + "╝", CYN))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def run():
+    ib = IB()
+    print_header()
+
+    # ── Connect (try TWS then IB Gateway) ─────────────────────────────────────
+    print()
+    connected = False
+    for port, name in [(TWS_PORT, "TWS"), (4001, "IB Gateway")]:
+        try:
+            await ib.connectAsync(TWS_HOST, port, clientId=CLIENT_ID, timeout=10)
+            print(c(f"  ✔  Connected to {name}  ({TWS_HOST}:{port})", GRN))
+            connected = True
+            break
+        except Exception as e:
+            print(c(f"  ✗  {name} port {port}: {e}", DIM))
+
+    if not connected:
+        print(c("\n  Cannot connect. Make sure TWS or IB Gateway is open", RED))
+        print(c("  and API access is enabled (Edit → Global Config → API).\n", YLW))
+        sys.exit(1)
+
+    results = []
+
+    # ── STOCKS ────────────────────────────────────────────────────────────────
+    print_section(
+        f"STOCKS  ({len(STOCKS)} instruments)",
+        f"ADJUSTED_LAST bars  •  {HISTORY_PERIOD} history  •  {REQUEST_TIMEOUT}s timeout per request"
+    )
+
+    for idx, (sym, exch, cur, name) in enumerate(STOCKS, 1):
+        contract = Stock(sym, exch, cur)
+        df = await fetch_bars(ib, contract, "ADJUSTED_LAST", sym)
+
+        sig        = compute_signal(df)
+        rows       = len(df) if df is not None else 0
+        p, m2, m5  = ma_values(df)
+
+        print_row(idx, len(STOCKS), f"{sym} {name}", sym, p, m2, m5, sig,
+                  extra=c(f"  [{rows}d]", DIM))
+
+        results.append({
+            "instrument": sym, "name": name, "type": "STK",
+            "signal": sig, "rows": rows,
+            "price": p, "ma200": m2, "ma500": m5,
+            "last5": last5_str(df),
+        })
+        await asyncio.sleep(SLEEP_BETWEEN)
+
+    # ── FX PAIRS ─────────────────────────────────────────────────────────────
+    print_section(
+        f"FX PAIRS  ({len(FX_PAIRS)} pairs)",
+        "BID bars (no subscription needed)  •  MIDPOINT skipped to avoid Error 162"
+    )
+
+    for idx, (base, quote) in enumerate(FX_PAIRS, 1):
+        label    = f"{base}/{quote}"
+        contract = Forex(f"{base}{quote}")
+        df       = await fetch_bars(ib, contract, "BID", label)
+
+        sig        = compute_signal(df)
+        rows       = len(df) if df is not None else 0
+        p, m2, m5  = ma_values(df)
+
+        print_row(idx, len(FX_PAIRS), label, label, p, m2, m5, sig,
+                  extra=c(f"  [{rows}d]", DIM))
+
+        results.append({
+            "instrument": label, "name": label, "type": "FX",
+            "signal": sig, "rows": rows,
+            "price": p, "ma200": m2, "ma500": m5,
+            "last5": last5_str(df),
+        })
+        await asyncio.sleep(SLEEP_BETWEEN)
+
+    ib.disconnect()
+
+    # ── RESULTS TABLE ────────────────────────────────────────────────────────
+    print_results_table(results)
+
+    # ── LAST 5 CLOSES (detail view) ───────────────────────────────────────────
+    print()
+    print(c("  LAST 5 CLOSES (date:price)", BOLD+CYN))
+    print(c("  " + "─"*66, DIM))
+    for r in results:
+        tag = c(f"[{r['type']}]", DIM)
+        print(f"  {tag}  {r['instrument']:<12}  {c(r['last5'], DIM)}")
+
+    # ── CSV EXPORT ────────────────────────────────────────────────────────────
+    csv_name = f"ma_screener_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    df_out = pd.DataFrame(results)
+    # Expand last5 into columns
+    df_out.to_csv(csv_name, index=False)
+    print()
+    print(c(f"  📄  Results saved → {csv_name}", CYN))
+    print()
+
+
+def main():
+    util.run(run())   # ib_insync's event-loop runner (handles Python 3.12 correctly)
+
+if __name__ == "__main__":
+    main()

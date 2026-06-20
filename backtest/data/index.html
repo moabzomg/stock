@@ -140,39 +140,6 @@
     <option value="">-- loading --</option>
   </select>
   <div class="ma-controls">
-    <span class="ma-label">TZ</span>
-    <select id="timezone" onchange="load()" style="min-width:unset;padding:5px 8px;font-size:12px;">
-      <option value="0">UTC</option>
-      <option value="1">UTC+1</option>
-      <option value="2">UTC+2</option>
-      <option value="3">UTC+3</option>
-      <option value="4">UTC+4</option>
-      <option value="5">UTC+5</option>
-      <option value="5.5">UTC+5:30</option>
-      <option value="6">UTC+6</option>
-      <option value="7">UTC+7</option>
-      <option value="8">UTC+8</option>
-      <option value="9">UTC+9</option>
-      <option value="9.5">UTC+9:30</option>
-      <option value="10">UTC+10</option>
-      <option value="11">UTC+11</option>
-      <option value="12">UTC+12</option>
-      <option value="-1">UTC-1</option>
-      <option value="-2">UTC-2</option>
-      <option value="-3">UTC-3</option>
-      <option value="-3.5">UTC-3:30</option>
-      <option value="-4">UTC-4</option>
-      <option value="-5">UTC-5 (ET)</option>
-      <option value="-6">UTC-6 (CT)</option>
-      <option value="-7">UTC-7 (MT)</option>
-      <option value="-8">UTC-8 (PT)</option>
-      <option value="-9">UTC-9</option>
-      <option value="-10">UTC-10</option>
-      <option value="-11">UTC-11</option>
-      <option value="-12">UTC-12</option>
-    </select>
-  </div>
-  <div class="ma-controls">
     <span class="ma-label">MA</span>
     <div class="pill active" data-ma="ma200" onclick="toggleMA(this)">200</div>
     <div class="pill active" data-ma="ma150" onclick="toggleMA(this)">150</div>
@@ -226,11 +193,6 @@ function fmtVol(n) {
   return String(n);
 }
 
-function getTZOffsetMs() {
-  const v = parseFloat(document.getElementById('timezone').value);
-  return (isNaN(v) ? 0 : v) * 3600 * 1000;
-}
-
 /* ── MA toggle state ── */
 const maVisible = { ma200: true, ma150: true, ma50: true };
 const maSeriesIndex = { ma200: 2, ma150: 3, ma50: 4 };
@@ -256,7 +218,7 @@ async function init() {
       .filter(l => l && l.endsWith('.csv') && !l.includes('_ma'));
 
     const sel = document.getElementById('symbol');
-    sel.innerHTML = '<option value="">- select symbol -</option>';
+    sel.innerHTML = '<option value="">-----select symbol ──</option>';
     files.forEach(f => {
       const opt = document.createElement('option');
       opt.value = f;
@@ -288,12 +250,11 @@ async function load() {
   /* ── price series ── */
   const ohlc   = [];
   const volume = [];
-  const tzOff = getTZOffsetMs();
   rows.forEach(r => {
     const t = parseDate(r.date);
     if (t == null) return;
-    ohlc.push([t - tzOff, +r.open, +r.high, +r.low, +r.close]);
-    volume.push([t - tzOff, +r.volume]);
+    ohlc.push([t, +r.open, +r.high, +r.low, +r.close]);
+    volume.push([t, +r.volume]);
   });
 
   /* ── MA series ── */
@@ -303,10 +264,9 @@ async function load() {
   maRows.forEach(r => {
     const t = parseDate(r.date || r.YYYYMMDD);
     if (t == null) return;
-    const v200 = parseFloat(r.ma200), v150 = parseFloat(r.ma150), v50 = parseFloat(r.ma50);
-    if (!isNaN(v200) && v200 > 0) ma200data.push([t - tzOff, v200]);
-    if (!isNaN(v150) && v150 > 0) ma150data.push([t - tzOff, v150]);
-    if (!isNaN(v50)  && v50  > 0) ma50data.push([t - tzOff, v50]);
+    if (r.ma200 !== '' && r.ma200 != null) ma200data.push([t, parseFloat(r.ma200)]);
+    if (r.ma150 !== '' && r.ma150 != null) ma150data.push([t, parseFloat(r.ma150)]);
+    if (r.ma50  !== '' && r.ma50  != null) ma50data.push([t,  parseFloat(r.ma50)]);
     latestMARow = r;
   });
 
@@ -331,10 +291,9 @@ async function load() {
   }
 
   if (latestMARow) {
-    const d200 = parseFloat(latestMARow.ma200), d150 = parseFloat(latestMARow.ma150), d50 = parseFloat(latestMARow.ma50);
-    document.getElementById('st-ma200').textContent = (!isNaN(d200) && d200 > 0) ? fmtNum(d200) : '-';
-    document.getElementById('st-ma150').textContent = (!isNaN(d150) && d150 > 0) ? fmtNum(d150) : '-';
-    document.getElementById('st-ma50').textContent  = (!isNaN(d50)  && d50  > 0) ? fmtNum(d50)  : '-';
+    document.getElementById('st-ma200').textContent = fmtNum(parseFloat(latestMARow.ma200));
+    document.getElementById('st-ma150').textContent = fmtNum(parseFloat(latestMARow.ma150));
+    document.getElementById('st-ma50').textContent  = fmtNum(parseFloat(latestMARow.ma50));
   } else {
     ['st-ma200','st-ma150','st-ma50'].forEach(id => document.getElementById(id).textContent = '-');
   }
@@ -344,7 +303,6 @@ async function load() {
   if (Highcharts.charts[0]) Highcharts.charts[0].destroy();
 
   Highcharts.stockChart('chart', {
-    time: { useUTC: true },
     chart: {
       backgroundColor: '#0d0d0f',
       style: { fontFamily: "'Courier New', monospace" }

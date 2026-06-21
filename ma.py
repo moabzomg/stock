@@ -21,25 +21,68 @@ def ma_csv_path(symbol: str) -> str:
 def _read_rows(fpath: str) -> list:
     with open(fpath, newline='') as f:
         r = csv.reader(f)
-        next(r, None)   # header: date,open,high,low,close,price,volume
+        next(r, None)   # header: datetime,open,close,high,low,volume
         return [row for row in r if row]
+
+
+def _is_minute_row(row: list) -> bool:
+    """True when the timestamp is minute-resolution (YYYYMMDDHHmm, len==12)."""
+    return len(row[0]) == 12
 
 
 def _daily_rows(rows: list) -> dict:
     """
-    Collapse rows — which may mix daily-resolution rows (timestamp ending
-    '0000') and minute-resolution rows for the most recent trading days —
-    into one row per calendar day: whichever row has the latest timestamp
-    that day. That's the official close/volume once the day is finished,
-    or the most recent snapshot if today's session is still in progress.
+    Collapse rows into one representative row per calendar day, handling a
+    file that mixes two resolutions:
 
-    Returns {yyyymmdd: row}.
+      • Day rows    – timestamp is 'YYYYMMDD' (len 8).  One row per day.
+      • Minute rows – timestamp is 'YYYYMMDDHHmm' (len 12).  Many per day.
+
+    Rules
+    -----
+    1. If a day has *any* minute rows, those are used exclusively (the daily
+       row for that same date, if present, is ignored — minute data is
+       authoritative for live/recent days).
+    2. The **close** used for that day is the close of the *last* minute bar
+       (highest timestamp), matching standard MA convention.
+    3. The **volume** for a minute-data day is the *sum* of all minute bars'
+       volumes, giving the true day total rather than a single bar's volume.
+    4. For pure day-resolution days, the single daily row is used as-is.
+
+    Returns {yyyymmdd: row} where row[2] is the day's close and row[5] is
+    the day's total volume.
     """
-    by_day = {}
+    minute_by_day = {}   # day -> list of minute rows
+    daily_by_day  = {}   # day -> single daily row
+
     for row in rows:
         day = row[0][:8]
-        if day not in by_day or row[0] > by_day[day][0]:
+        if _is_minute_row(row):
+            minute_by_day.setdefault(day, []).append(row)
+        else:
+            # Keep the latest if somehow multiple daily rows exist for one day
+            if day not in daily_by_day or row[0] > daily_by_day[day][0]:
+                daily_by_day[day] = row
+
+    by_day = {}
+
+    # Days that have only a daily row
+    for day, row in daily_by_day.items():
+        if day not in minute_by_day:
             by_day[day] = row
+
+    # Days that have minute bars — minute data takes precedence
+    for day, mrows in minute_by_day.items():
+        mrows_sorted = sorted(mrows, key=lambda r: r[0])
+        last_bar     = mrows_sorted[-1]   # latest minute bar → provides close
+
+        total_volume = sum(float(r[5]) for r in mrows_sorted)
+
+        # Copy the last bar's columns; replace volume with the day total
+        synthetic    = list(last_bar)
+        synthetic[5] = str(int(total_volume))
+        by_day[day]  = synthetic
+
     return by_day
 
 
@@ -68,7 +111,7 @@ def compute_ma_series(symbol: str, start_date: str = None, end_date: str = None)
     if not ordered_days:
         return None
 
-    closes = [float(by_day[d][4]) for d in ordered_days]   # index 4 = close
+    closes = [float(by_day[d][2]) for d in ordered_days]   # index 2 = close
 
     if start_date is None and end_date is None:
         target_idxs = [len(ordered_days) - 1]
@@ -92,13 +135,13 @@ def compute_ma_series(symbol: str, start_date: str = None, end_date: str = None)
                 mas[period] = NA
 
         results.append({
-            'date':            d,        # YYYYMMDD
-            'symbol':          symbol,
-            'ma200':           mas[200],
-            'ma150':           mas[150],
-            'ma50':            mas[50],
-            'latest price':    row[5],   # index 5 = 'price' column
-            'latest volume':   row[6],   # index 6 = 'volume' column
+            'date':          d,        # YYYYMMDD
+            'symbol':        symbol,
+            'ma200':         mas[200],
+            'ma150':         mas[150],
+            'ma50':          mas[50],
+            'latest price':  row[2],   # index 2 = close (last minute bar on minute days)
+            'latest volume': row[5],   # index 5 = volume (summed across bars on minute days)
         })
     return results
 

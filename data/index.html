@@ -150,24 +150,17 @@ function toggleMA(el) {
 
 async function init() {
   try {
-    // Python's http.server serves a browsable HTML directory listing
-    const html = await (await fetch('./')).text();
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-    const files = [...doc.querySelectorAll('a')]
-      .map(a => decodeURIComponent(a.getAttribute('href') || ''))
-      .filter(f => f.endsWith('.csv') && !f.endsWith('_ma.csv'));
-
+    const symbols = await (await fetch('/list')).json();
     const sel = document.getElementById('symbol');
-    sel.innerHTML = '<option value="">── select symbol ──</option>';
-    files.forEach(f => {
+    sel.innerHTML = '<option value="">-- select symbol --</option>';
+    symbols.forEach(name => {
       const opt = document.createElement('option');
-      opt.value = f;
-      opt.text = f.replace('.csv', '');
+      opt.value = name + '.csv';
+      opt.text = name;
       sel.appendChild(opt);
     });
-    if (!files.length) showError('No CSV files found in this directory.');
   } catch(e) {
-    showError('Could not list directory: ' + e.message);
+    showError('Could not load symbol list: ' + e.message);
   }
 }
 

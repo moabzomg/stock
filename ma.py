@@ -7,7 +7,7 @@ DATA_DIR   = 'data'
 MA_PERIODS = (200, 150, 50)   # trading-day lookback windows
 NA         = -1               # used whenever there isn't enough history
 
-FIELDNAMES = ['date', 'symbol', 'ma200', 'ma150', 'ma50', 'latest price', 'latest volume']
+FIELDNAMES = ['date', 'symbol', 'ma200', 'ma150', 'ma50']
 
 
 def csv_path(symbol: str) -> str:
@@ -140,8 +140,6 @@ def compute_ma_series(symbol: str, start_date: str = None, end_date: str = None)
             'ma200':         mas[200],
             'ma150':         mas[150],
             'ma50':          mas[50],
-            'latest price':  row[2],   # index 2 = close (last minute bar on minute days)
-            'latest volume': row[5],   # index 5 = volume (summed across bars on minute days)
         })
     return results
 
@@ -198,4 +196,4 @@ if __name__ == '__main__':
     print(f"Updated {ma_csv_path(symbol_arg)} with {len(series)} date(s):")
     for r in series:
         print(f"  {r['date']}  ma200={r['ma200']}  ma150={r['ma150']}  "
-              f"ma50={r['ma50']}  price={r['latest price']}  volume={r['latest volume']}")
+              f"ma50={r['ma50']}")

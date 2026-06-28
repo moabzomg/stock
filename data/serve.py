@@ -4,8 +4,19 @@ from http.server import SimpleHTTPRequestHandler, HTTPServer
 class H(SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/list':
-            files = sorted(f[:-4] for f in os.listdir('.') if f.endswith('.csv') and not f.endswith('_ma.csv'))
-            b = json.dumps(files).encode()
+            symbols = {}
+            for f in os.listdir('.'):
+                if f.endswith('_daily.csv'):
+                    sym = f[:-10]
+                    symbols.setdefault(sym, []).append('daily')
+                elif f.endswith('_minute.csv'):
+                    sym = f[:-11]
+                    symbols.setdefault(sym, []).append('minute')
+            result = [
+                {'symbol': sym, 'periods': sorted(periods)}
+                for sym, periods in sorted(symbols.items())
+            ]
+            b = json.dumps(result).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', len(b))

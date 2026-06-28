@@ -1,271 +1,266 @@
 #!/usr/bin/env python3
 """
-batch_minute_extract.py — Run all_minute_extract_data.extract_symbol() for
-every symbol listed in watch_list.txt (one symbol per line, # = comment).
-
 Usage:
-    python3 batch_minute_extract.py <YYYYMMDDHHmm> [--parallel N]
-
-Arguments:
-    YYYYMMDDHHmm   Start datetime (UTC). All symbols are fetched from this
-                   point forward. Required.
-    --parallel N   Number of symbols to process at the same time (default: 1).
-                   Each parallel worker uses a different IB client ID so TWS
-                   accepts all connections simultaneously.
-                   WARNING: each parallel worker fires its own IB requests.
-                   N=3 triples your request rate — stay well under the IB
-                   60-requests-per-10-min limit (effective rate with
-                   INTER_REQUEST_SLEEP=10 s is 6 req/min per worker, so
-                   N ≤ 9 is safe; default N=1 is safest).
-
-Examples:
-    # Sequential (safest, one symbol at a time):
-    python3 batch_minute_extract.py 202401010930
-
-    # Three symbols in parallel (3× faster, 3× IB request rate):
-    python3 batch_minute_extract.py 202401010930 --parallel 3
-
-Output:
-    data/<SYMBOL>.csv for each symbol — same format as the single-symbol script.
-    A summary table is printed at the end showing new-bar counts and any errors.
+    python3 batch_minute_extract.py <YYYYMMDDHHmm> [--watchlist FILE]
 """
 
-import sys
-import os
-import argparse
-import subprocess
-import time
-import threading
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys, os, time, csv, threading, subprocess, argparse
+from datetime import datetime, timedelta, timezone
+from collections import deque
 
-# Import the core extraction function from the single-symbol script.
-# Both files must live in the same directory.
-try:
-    from all_minute_extract_data import extract_symbol, parse_start, CLIENT_ID
-except ImportError:
-    sys.exit(
-        "ERROR: all_minute_extract_data.py not found in the same directory.\n"
-        "Both scripts must be co-located."
-    )
+from ibapi.client import EClient
+from ibapi.wrapper import EWrapper
+from ibapi.contract import Contract
 
-# ── Base client ID for batch workers ─────────────────────────────────────────
-# Each parallel worker gets CLIENT_ID + worker_index so TWS accepts them all.
-# CLIENT_ID itself is not used by the batch runner (that's for single-symbol
-# direct invocation), but we start from CLIENT_ID + 1 to leave a gap.
-BATCH_CLIENT_ID_BASE = CLIENT_ID + 1   # e.g. 11 if CLIENT_ID=10
+IB_HOST   = "127.0.0.1"
+IB_PORT   = 7496
+CLIENT_ID = 10
 
-# ── ma.py path ────────────────────────────────────────────────────────────────
-# Resolved relative to this script's own location so it works regardless of
-# the working directory the script is invoked from.
-MA_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ma.py")
+INTER_REQUEST_SLEEP  = 10
+MAX_REQUESTS_PER_10M = 55
+REQUEST_WINDOW_SECS  = 600
+CHUNK_STEP_DAYS      = 1
+
+_HERE   = os.path.dirname(os.path.abspath(__file__))
+_PARENT = os.path.dirname(_HERE)
 
 
-# ── Watch list loader ─────────────────────────────────────────────────────────
+class IBExtractor(EWrapper, EClient):
+    def __init__(self):
+        EWrapper.__init__(self)
+        EClient.__init__(self, wrapper=self)
+        self._req_id     = 1
+        self._bars       = []
+        self._done       = threading.Event()
+        self._error      = False
+        self._request_ts = deque()
 
-def load_symbols(path: str = "watch_list.txt") -> list[str]:
-    if not os.path.exists(path):
-        sys.exit(f"ERROR: {path} not found.")
-    symbols = []
-    with open(path) as f:
-        for line in f:
-            s = line.strip()
-            if s and not s.startswith("#"):
-                symbols.append(s.upper())
-    if not symbols:
-        sys.exit(f"ERROR: {path} contains no symbols.")
-    return symbols
+    def historicalData(self, reqId, bar):
+        raw = bar.date.strip()
+        try:
+            dt = datetime.fromtimestamp(int(raw), tz=timezone.utc)
+        except ValueError:
+            dt = datetime.strptime(raw, "%Y%m%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        self._bars.append({
+            "datetime": dt.strftime("%Y%m%d%H%M"),
+            "open": bar.open, "close": bar.close,
+            "high": bar.high, "low":   bar.low, "volume": bar.volume,
+        })
 
+    def historicalDataEnd(self, reqId, start, end):
+        self._done.set()
 
-# ── MA runner ─────────────────────────────────────────────────────────────────
-
-def run_ma(symbol: str, start_date: str) -> tuple[bool, str]:
-    """
-    Run `python3 ../ma.py <SYMBOL> <YYYYMMDD>` and return (success, message).
-    Captures stdout/stderr so it doesn't interleave with the batch progress log;
-    the combined output is returned in *message* for the summary.
-    """
-    if not os.path.exists(MA_SCRIPT):
-        return False, f"ma.py not found at {MA_SCRIPT}"
-    cmd = [sys.executable, MA_SCRIPT, symbol, start_date]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        output = (result.stdout + result.stderr).strip()
-        if result.returncode != 0:
-            return False, f"exit {result.returncode}: {output}"
-        return True, output
-    except subprocess.TimeoutExpired:
-        return False, "timed out after 120s"
-    except Exception as exc:
-        return False, str(exc)
-
-
-# ── Worker ────────────────────────────────────────────────────────────────────
-
-def worker(symbol: str, start_dt: datetime, start_date: str, client_id: int,
-           results: dict, lock: threading.Lock):
-    """
-    Thread target. Calls extract_symbol then ma.py, records both outcomes.
-    Uses *lock* only for the final dict write (extract_symbol itself is
-    thread-safe: each call creates its own IBMinuteExtractor with a distinct
-    client_id and its own IB socket connection).
-    """
-    t0 = time.time()
-    try:
-        new_bars = extract_symbol(symbol, start_dt, client_id=client_id)
-
-        # Run ma.py immediately after this symbol's bars are on disk
-        print(f"  [ma] running ma.py for {symbol} from {start_date} …")
-        ma_ok, ma_msg = run_ma(symbol, start_date)
-        if ma_ok:
-            print(f"  [ma] {symbol}: ok")
+    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+        if errorCode in (2104, 2106, 2107, 2108, 2119, 2150, 2158):
+            return
+        if errorCode in (162, 321, 1100, 1101, 1102, 2110):
+            print(f"  [warn] {errorCode}: {errorString}")
+            self._done.set()
         else:
-            print(f"  [ma] {symbol}: FAILED — {ma_msg}")
+            print(f"  [error] {errorCode}: {errorString}")
+            self._error = True
+            self._done.set()
 
-        elapsed = time.time() - t0
-        with lock:
-            results[symbol] = {
-                "status":    "ok",
-                "new_bars":  new_bars,
-                "elapsed":   elapsed,
-                "ma_ok":     ma_ok,
-                "ma_msg":    ma_msg,
-            }
-    except Exception as exc:
-        elapsed = time.time() - t0
-        with lock:
-            results[symbol] = {
-                "status":  "error",
-                "error":   str(exc),
-                "elapsed": elapsed,
-                "ma_ok":   False,
-                "ma_msg":  "",
-            }
+    def connectAck(self):
+        print(f"  [ib] connected to {IB_HOST}:{IB_PORT}")
+
+    def _pace(self):
+        now = time.time()
+        while self._request_ts and now - self._request_ts[0] > REQUEST_WINDOW_SECS:
+            self._request_ts.popleft()
+        if len(self._request_ts) >= MAX_REQUESTS_PER_10M:
+            wait = REQUEST_WINDOW_SECS - (now - self._request_ts[0]) + 1
+            print(f"  [pace] sleeping {wait:.0f}s")
+            time.sleep(wait)
+            now = time.time()
+            while self._request_ts and now - self._request_ts[0] > REQUEST_WINDOW_SECS:
+                self._request_ts.popleft()
+        if self._request_ts:
+            elapsed = time.time() - self._request_ts[-1]
+            if elapsed < INTER_REQUEST_SLEEP:
+                time.sleep(INTER_REQUEST_SLEEP - elapsed)
+        self._request_ts.append(time.time())
+
+    def fetch(self, contract, end_dt):
+        self._bars, self._error = [], False
+        self._done.clear()
+        self._pace()
+        end_str = end_dt.strftime("%Y%m%d-%H:%M:%S")
+        print(f"  → end={end_str} ...", end="", flush=True)
+        self.reqHistoricalData(
+            self._req_id, contract, end_str, "1 D",
+            "1 min", "TRADES", 0, 2, 0, [],
+        )
+        self._req_id += 1
+        if not self._done.wait(timeout=120):
+            print(" TIMEOUT")
+            self.cancelHistoricalData(self._req_id - 1)
+            return []
+        bars = list(self._bars)
+        print(f" {len(bars)} bars" + (f"  ({bars[0]['datetime']} → {bars[-1]['datetime']})" if bars else ""))
+        return bars
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+def make_contract(symbol):
+    c = Contract()
+    c.symbol, c.secType, c.exchange, c.currency = symbol, "STK", "SMART", "USD"
+    return c
+
+
+def is_valid(bar):
+    try:
+        o, c, h, l, v = float(bar["open"]), float(bar["close"]), float(bar["high"]), float(bar["low"]), float(bar["volume"])
+        return o > 0 and c > 0 and h > 0 and l > 0 and h >= l and v >= 0
+    except (ValueError, TypeError, KeyError):
+        return False
+
+
+def load_csv(symbol):
+    path = os.path.join("data", f"{symbol}_minute.csv")
+    if not os.path.exists(path):
+        return [], set()
+    with open(path, newline="") as f:
+        bars = [{"datetime": r["datetime"], "open": float(r["open"]), "close": float(r["close"]),
+                 "high": float(r["high"]), "low": float(r["low"]), "volume": float(r["volume"])}
+                for r in csv.DictReader(f)]
+    bars = [b for b in bars if is_valid(b)]
+    seen = {b["datetime"] for b in bars}
+    if bars:
+        print(f"  [resume] {len(bars)} existing bars ({min(seen)} → {max(seen)})")
+    return bars, seen
+
+
+def save_csv(symbol, bars):
+    os.makedirs("data", exist_ok=True)
+    path = os.path.join("data", f"{symbol}_minute.csv")
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["datetime","open","close","high","low","volume"], extrasaction="ignore")
+        w.writeheader()
+        w.writerows(bars)
+    print(f"  [saved] {len(bars)} bars → {path}")
+
+
+def compute_gaps(seen, start_dt, now_utc):
+    midnight = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if not seen:
+        return [(start_dt, midnight)]
+    days     = {dt[:8] for dt in seen}
+    earliest = datetime.strptime(min(days), "%Y%m%d").replace(tzinfo=timezone.utc)
+    latest   = datetime.strptime(max(days), "%Y%m%d").replace(tzinfo=timezone.utc)
+    gaps = []
+    if start_dt < earliest:
+        gaps.append((start_dt, earliest))
+    tail = latest + timedelta(days=1)
+    if tail < midnight:
+        gaps.append((tail, midnight))
+    return gaps
+
+
+def run_post(symbol, earliest_date):
+    for cmd in [
+        [sys.executable, os.path.join(_PARENT, "collapse_to_daily.py"), symbol],
+        [sys.executable, os.path.join(_PARENT, "ma.py"), symbol, earliest_date],
+    ]:
+        r = subprocess.run(cmd)
+        if r.returncode != 0:
+            print(f"  [warn] {os.path.basename(cmd[1])} exited {r.returncode}")
+
+
+def extract_symbol(app, symbol, start_dt, now_utc):
+    all_bars, seen = load_csv(symbol)
+    before         = len(all_bars)
+    gaps           = compute_gaps(seen, start_dt, now_utc)
+
+    if not gaps:
+        print(f"  [{symbol}] already up to date")
+    else:
+        for gap_start, gap_end in gaps:
+            print(f"  [gap] {gap_start:%Y-%m-%d} → {gap_end:%Y-%m-%d}")
+
+    contract = make_contract(symbol)
+    for gap_start, gap_end in gaps:
+        chunk_end = gap_end
+        while chunk_end > gap_start:
+            bars = app.fetch(contract, chunk_end)
+            if app._error:
+                print(f"  [error] stopping {symbol}")
+                break
+            for b in bars:
+                bdt = datetime.strptime(b["datetime"], "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+                if bdt >= start_dt and b["datetime"] not in seen and is_valid(b):
+                    seen.add(b["datetime"])
+                    all_bars.append(b)
+            chunk_end -= timedelta(days=CHUNK_STEP_DAYS)
+        else:
+            continue
+        break
+
+    new_count = len(all_bars) - before
+    if all_bars:
+        all_bars.sort(key=lambda b: b["datetime"])
+        save_csv(symbol, all_bars)
+        print(f"  [{symbol}] +{new_count} new bars, {len(all_bars)} total")
+        run_post(symbol, all_bars[0]["datetime"][:8])
+    return new_count
+
+
+def load_symbols(path):
+    if not os.path.exists(path):
+        sys.exit(f"ERROR: {path} not found")
+    syms = [l.strip().upper() for l in open(path) if l.strip() and not l.startswith("#")]
+    if not syms:
+        sys.exit(f"ERROR: {path} has no symbols")
+    return syms
+
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Batch 1-min bar extractor for all symbols in watch_list.txt"
-    )
-    parser.add_argument(
-        "start",
-        metavar="YYYYMMDDHHmm",
-        help="Start datetime (UTC) — fetch bars from this point forward"
-    )
-    parser.add_argument(
-        "--parallel", "-p",
-        metavar="N",
-        type=int,
-        default=1,
-        help="Number of symbols to process in parallel (default: 1)"
-    )
-    parser.add_argument(
-        "--watchlist", "-w",
-        metavar="FILE",
-        default="watch_list.txt",
-        help="Path to watch list file (default: watch_list.txt)"
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("start", metavar="YYYYMMDDHHmm")
+    parser.add_argument("--watchlist", "-w", default="extract_list.txt")
     args = parser.parse_args()
 
-    if args.parallel < 1:
-        sys.exit("ERROR: --parallel must be >= 1")
-
-    start_dt = parse_start(args.start)
-    if start_dt >= datetime.now(timezone.utc):
-        sys.exit("ERROR: start datetime must be in the past.")
+    try:
+        start_dt = datetime.strptime(args.start, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        sys.exit(f"ERROR: bad datetime '{args.start}', expected YYYYMMDDHHmm")
+    now_utc = datetime.now(timezone.utc)
+    if start_dt >= now_utc:
+        sys.exit("ERROR: start must be in the past")
 
     symbols = load_symbols(args.watchlist)
+    print(f"\n[batch] {len(symbols)} symbol(s) from {start_dt:%Y-%m-%d %H:%M UTC}")
 
-    # YYYYMMDD date passed to ma.py — the date portion of the start argument
-    start_date = args.start[:8]
+    app = IBExtractor()
+    app.connect(IB_HOST, IB_PORT, CLIENT_ID)
+    threading.Thread(target=app.run, daemon=True).start()
+    time.sleep(2)
+    if not app.isConnected():
+        sys.exit("ERROR: could not connect to IB")
 
-    print(f"\n{'='*60}")
-    print(f"  Batch 1-min extract")
-    print(f"  Symbols   : {len(symbols)}")
-    print(f"  Start     : {start_dt:%Y-%m-%d %H:%M UTC}")
-    print(f"  MA date   : {start_date}")
-    print(f"  Parallel  : {args.parallel} worker(s)")
-    print(f"  Watch list: {args.watchlist}")
-    print(f"  ma.py     : {MA_SCRIPT}")
-    print(f"{'='*60}\n")
-
-    results: dict = {}
-    lock = threading.Lock()
-
-    if args.parallel == 1:
-        # Sequential — simplest, no ThreadPoolExecutor overhead, cleaner logs
-        for idx, symbol in enumerate(symbols):
-            cid = BATCH_CLIENT_ID_BASE + (idx % args.parallel)
-            worker(symbol, start_dt, start_date, cid, results, lock)
-    else:
-        # Parallel — assign a stable client ID slot to each worker index.
-        # With N workers we need N distinct client IDs; we rotate them in
-        # round-robin across the symbol list so no two live workers ever
-        # share an ID.
-        with ThreadPoolExecutor(max_workers=args.parallel) as pool:
-            futures = {}
-            for idx, symbol in enumerate(symbols):
-                cid = BATCH_CLIENT_ID_BASE + (idx % args.parallel)
-                f = pool.submit(worker, symbol, start_dt, start_date, cid, results, lock)
-                futures[f] = symbol
-
-            for f in as_completed(futures):
-                sym = futures[f]
-                exc = f.exception()
-                if exc:
-                    with lock:
-                        results[sym] = {
-                            "status": "error", "error": str(exc),
-                            "elapsed": 0, "ma_ok": False, "ma_msg": "",
-                        }
-
-    # ── Summary table ─────────────────────────────────────────────────────────
-    print(f"\n{'='*68}")
-    print(f"  BATCH COMPLETE — {len(symbols)} symbol(s)")
-    print(f"{'='*68}")
-    print(f"  {'SYMBOL':<10}  {'STATUS':<8}  {'NEW BARS':>10}  {'MA':>4}  {'TIME':>8}")
-    print(f"  {'-'*10}  {'-'*8}  {'-'*10}  {'-'*4}  {'-'*8}")
-
-    total_new  = 0
-    errors     = []
-    ma_errors  = []
+    results = {}
     for symbol in symbols:
-        r = results.get(symbol, {"status": "missing", "new_bars": 0, "elapsed": 0,
-                                  "ma_ok": False, "ma_msg": ""})
-        if r["status"] == "ok":
-            bars_str = str(r["new_bars"])
-            total_new += r["new_bars"]
-            ma_str = "ok" if r.get("ma_ok") else "FAIL"
-            if not r.get("ma_ok"):
-                ma_errors.append((symbol, r.get("ma_msg", "")))
-        else:
-            bars_str = "—"
-            ma_str   = "—"
-            errors.append((symbol, r.get("error", "unknown")))
-        time_str = f"{r['elapsed']:.0f}s"
-        print(f"  {symbol:<10}  {r['status']:<8}  {bars_str:>10}  {ma_str:>4}  {time_str:>8}")
+        t0 = time.time()
+        try:
+            new_bars = extract_symbol(app, symbol, start_dt, now_utc)
+            results[symbol] = (new_bars, time.time() - t0, None)
+        except Exception as e:
+            print(f"  [!] {symbol}: {e}")
+            results[symbol] = (0, time.time() - t0, str(e))
 
-    print(f"  {'-'*10}  {'-'*8}  {'-'*10}  {'-'*4}  {'-'*8}")
-    print(f"  {'TOTAL':<10}  {'':8}  {total_new:>10}")
+    app.disconnect()
 
-    if errors:
-        print(f"\n  Extraction errors ({len(errors)}):")
-        for sym, msg in errors:
-            print(f"    {sym}: {msg}")
-
-    if ma_errors:
-        print(f"\n  MA errors ({len(ma_errors)}):")
-        for sym, msg in ma_errors:
-            print(f"    {sym}: {msg}")
-
-    print(f"{'='*68}\n")
+    print(f"\n{'─'*50}")
+    print(f"  {'SYMBOL':<10}  {'NEW BARS':>10}  {'TIME':>7}  STATUS")
+    print(f"  {'─'*10}  {'─'*10}  {'─'*7}  {'─'*10}")
+    total = 0
+    for sym in symbols:
+        n, t, err = results[sym]
+        total += n
+        status = err or "ok"
+        print(f"  {sym:<10}  {n:>10}  {t:>6.0f}s  {status}")
+    print(f"  {'─'*10}  {'─'*10}")
+    print(f"  {'TOTAL':<10}  {total:>10}")
+    print(f"{'─'*50}\n")
 
 
 if __name__ == "__main__":

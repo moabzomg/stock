@@ -4,7 +4,6 @@
 <title>Stock Visualiser</title>
 <script src="https://code.highcharts.com/stock/highstock.js"></script>
 <script src="https://code.highcharts.com/stock/modules/drag-panes.js"></script>
-<script src="https://code.highcharts.com/stock/modules/mouse-wheel-zoom.js"></script>
 <script src="https://code.highcharts.com/stock/indicators/indicators.js"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; }
@@ -37,18 +36,19 @@
   #error { color: #ef5350; font-size: 12px; padding: 8px 24px; display: none; }
   .refresh-badge { font-size: 10px; letter-spacing: .1em; color: #444456; white-space: nowrap; margin-left: auto; }
   .refresh-badge span { color: #5f9fff; }
-  .kb-hint { font-size: 10px; color: #333344; letter-spacing: .08em; padding: 5px 24px; border-top: 1px solid #141420; }
-  .kb-hint kbd { background: #18181f; border: 1px solid #2a2a38; border-radius: 2px; padding: 1px 5px; font-family: 'Courier New', monospace; color: #555566; font-size: 10px; }
+  .pill-ext { border-color: #888899; color: #888899; }
+  .pill-ext.active { background: rgba(136,136,153,.12); opacity: 1; }
+  .pill-ext { opacity: .4; }
 </style>
 </head>
 <body>
 
 <div class="topbar">
-  <h2>&#9658; Stock Visualiser</h2>
+  <h2>▸ Stock Visualiser</h2>
   <select id="symbol" onchange="onSymbolChange()">
     <option value="">-- loading --</option>
   </select>
-  <select id="period" onchange="onPeriodChange()">
+  <select id="period" onchange="load()">
     <option value="daily">Daily</option>
   </select>
   <div id="ma-section">
@@ -61,7 +61,7 @@
   </div>
   <div class="ma-controls">
     <span class="ma-label">TZ</span>
-    <select id="timezone" onchange="onTZChange()" style="min-width:unset;padding:5px 8px;font-size:12px;">
+    <select id="timezone" onchange="load()" style="min-width:unset;padding:5px 8px;font-size:12px;">
       <option value="0">UTC</option>
       <option value="1">UTC+1</option>
       <option value="2">UTC+2</option>
@@ -92,6 +92,10 @@
       <option value="-12">UTC-12</option>
     </select>
   </div>
+  <div class="ma-controls" id="ext-section">
+    <span class="ma-label">EXT</span>
+    <div class="pill pill-ext" id="pill-ext" onclick="toggleExt(this)">Pre/Post</div>
+  </div>
   <div class="refresh-badge">auto-refresh <span id="countdown">30</span>s</div>
 </div>
 
@@ -106,40 +110,12 @@
 
 <div id="error"></div>
 <div id="chart"></div>
-<div class="kb-hint">
-  <kbd>&larr;</kbd><kbd>&rarr;</kbd> pan &nbsp;
-  <kbd>+</kbd><kbd>-</kbd> zoom &nbsp;
-  scroll wheel to zoom &nbsp;
-  drag to pan
-</div>
 
 <script>
-let catalogue     = [];
-// Saved xAxis extremes: updated by afterSetExtremes on every user interaction,
-// restored after auto-refresh so the view does not jump back to the default range.
-// Cleared to null on symbol/period/TZ changes so those start fresh.
-let savedExtremes = null;
-// True during Highcharts.stockChart() initialisation - prevents afterSetExtremes
-// from overwriting savedExtremes with the newly-created chart's default range.
-let blockSave     = false;
+let catalogue = [];
+let showExtMarket = false;
 
-// Cached DOM references
-const EL = {
-  symbol:    document.getElementById('st-symbol'),
-  price:     document.getElementById('st-price'),
-  vol:       document.getElementById('st-vol'),
-  ma200:     document.getElementById('st-ma200'),
-  ma150:     document.getElementById('st-ma150'),
-  ma50:      document.getElementById('st-ma50'),
-  countdown: document.getElementById('countdown'),
-  error:     document.getElementById('error'),
-  maSection: document.getElementById('ma-section'),
-  ma200stat: document.getElementById('ma200-stat'),
-  ma150stat: document.getElementById('ma150-stat'),
-  ma50stat:  document.getElementById('ma50-stat'),
-};
-
-// Fetch helper - returns text or null, never throws
+// ── Fetch helper (returns text or null, never throws) ──────────────────────
 async function fetchText(url) {
   try {
     const r = await fetch(url);
@@ -147,8 +123,9 @@ async function fetchText(url) {
   } catch { return null; }
 }
 
-// Price CSV parser - index-based, no per-row object allocation
-// Row layout: [ts, open, close, high, low, volume]
+// ── CSV parser (index-based, no per-row object allocation) ─────────────────
+// Expected columns: datetime, open, close, high, low, volume
+// Output row layout: [ts, open, close, high, low, volume]
 function parseCSVFast(text) {
   const nl   = text.indexOf('\n');
   const cols = text.slice(0, nl).split(',').map(s => s.trim());
@@ -173,13 +150,14 @@ function parseCSVFast(text) {
     const f = line.split(',');
     if (f.length < 2) continue;
 
+    // Parse datetime inline — no regex, pure arithmetic
     const d = f[iDT];
     let ts = 0;
     if (d.length >= 12) {
-      ts = Date.UTC(d.slice(0,4)|0, (d.slice(4,6)|0)-1, d.slice(6,8)|0,
+      ts = Date.UTC(d.slice(0,4)|0, (d.slice(4,6)|0) - 1, d.slice(6,8)|0,
                     d.slice(8,10)|0, d.slice(10,12)|0, 0);
     } else if (d.length >= 8) {
-      ts = Date.UTC(d.slice(0,4)|0, (d.slice(4,6)|0)-1, d.slice(6,8)|0);
+      ts = Date.UTC(d.slice(0,4)|0, (d.slice(4,6)|0) - 1, d.slice(6,8)|0);
     }
 
     rows.push([ts, +f[iO], +f[iC], +f[iH], +f[iL], +f[iV]]);
@@ -187,12 +165,9 @@ function parseCSVFast(text) {
   return rows;
 }
 
-// Parse MA CSV and populate output arrays in a single pass - no intermediate array.
-// Returns { ma200, ma150, ma50, latest }
-function buildMAData(text) {
-  const out = { ma200: [], ma150: [], ma50: [], latest: null };
-  if (!text) return out;
-
+// ── MA CSV parser ──────────────────────────────────────────────────────────
+// Output row layout: [ts, ma200, ma150, ma50]
+function parseMACSV(text) {
   const nl   = text.indexOf('\n');
   const cols = text.slice(0, nl).split(',').map(s => s.trim());
   const iDT  = cols.findIndex(c => c === 'datetime' || c === 'date' || c === 'YYYYMMDD');
@@ -200,6 +175,7 @@ function buildMAData(text) {
   const i150 = cols.indexOf('ma150');
   const i50  = cols.indexOf('ma50');
 
+  const rows = [];
   let pos = nl + 1;
   const len = text.length;
 
@@ -210,34 +186,27 @@ function buildMAData(text) {
     pos = end + 1;
     if (!line) continue;
 
-    const f   = line.split(',');
-    const raw = f[iDT] ?? '';
-    if (raw.length < 8) continue;
-
-    // Handle both YYYYMMDD and YYYY-MM-DD without regex
-    const sep = raw.charCodeAt(4) === 45; // 45 = '-'
-    const ts  = Date.UTC(
-      raw.slice(0, 4) | 0,
-      (raw.slice(sep ? 5 : 4, sep ? 7 : 6) | 0) - 1,
-      raw.slice(sep ? 8 : 6, sep ? 10 : 8) | 0
-    );
-
-    const v200 = +f[i200], v150 = +f[i150], v50 = +f[i50];
-    if (v200 > 0) out.ma200.push([ts, v200]);
-    if (v150 > 0) out.ma150.push([ts, v150]);
-    if (v50  > 0) out.ma50.push([ts, v50]);
-    out.latest = [ts, v200, v150, v50];
+    const f  = line.split(',');
+    const dn = (f[iDT] ?? '').replace(/\D/g, '');
+    if (dn.length < 8) continue;
+    let ts;
+    if (dn.length >= 12)
+      ts = Date.UTC(dn.slice(0,4)|0, (dn.slice(4,6)|0)-1, dn.slice(6,8)|0, dn.slice(8,10)|0, dn.slice(10,12)|0, 0);
+    else
+      ts = Date.UTC(dn.slice(0,4)|0, (dn.slice(4,6)|0)-1, dn.slice(6,8)|0);
+    rows.push([ts, +f[i200], +f[i150], +f[i50]]);
   }
-  return out;
+  return rows;
 }
 
-// Slice to last N calendar days via binary search
+// ── Slice to last N calendar days (binary search) ─────────────────────────
 function sliceLastDays(rows, n) {
   if (!rows.length) return rows;
-  const DAY     = 86_400_000;
-  const lastTs  = rows[rows.length - 1][0];
+  const DAY    = 86_400_000;
+  const lastTs = rows[rows.length - 1][0];
   const lastDay = lastTs - (lastTs % DAY);
   const cutoff  = lastDay - (n - 1) * DAY;
+
   let lo = 0, hi = rows.length;
   while (lo < hi) {
     const mid = (lo + hi) >>> 1;
@@ -246,7 +215,7 @@ function sliceLastDays(rows, n) {
   return rows.slice(lo);
 }
 
-// Formatting helpers
+// ── Formatting ─────────────────────────────────────────────────────────────
 function fmtNum(n) {
   if (!isFinite(n) || n < 0) return '-';
   return n.toLocaleString('en-GB', { maximumFractionDigits: 4 });
@@ -262,7 +231,7 @@ function getTZOffsetMs() {
   return (parseFloat(document.getElementById('timezone').value) || 0) * 3_600_000;
 }
 
-// MA toggle
+// ── MA toggle ──────────────────────────────────────────────────────────────
 const maVisible     = { ma200: true, ma150: true, ma50: true };
 const maSeriesIndex = { ma200: 2,    ma150: 3,    ma50: 4    };
 
@@ -270,16 +239,22 @@ function toggleMA(el) {
   const key = el.dataset.ma;
   maVisible[key] = !maVisible[key];
   el.classList.toggle('active', maVisible[key]);
-  const chart = Highcharts.charts[0];
+  const chart = Highcharts.charts.find(Boolean);
   if (chart) {
     const s = chart.series[maSeriesIndex[key]];
     if (s) maVisible[key] ? s.show() : s.hide();
   }
 }
 
-// Symbol change: reset saved range (new instrument = new context)
+// ── Pre/post market toggle ────────────────────────────────────────────────
+function toggleExt(el) {
+  showExtMarket = !showExtMarket;
+  el.classList.toggle('active', showExtMarket);
+  load();
+}
+
+// ── Symbol change → rebuild period dropdown ────────────────────────────────
 function onSymbolChange() {
-  savedExtremes = null;
   const sym   = document.getElementById('symbol').value;
   const entry = catalogue.find(e => e.symbol === sym);
   const sel   = document.getElementById('period');
@@ -297,118 +272,111 @@ function onSymbolChange() {
   load();
 }
 
-// Period change: reset saved range (different timescale)
-function onPeriodChange() {
-  savedExtremes = null;
-  load();
-}
-
-// TZ change: reset saved range (display timestamps shift, old extremes would be wrong)
-function onTZChange() {
-  savedExtremes = null;
-  load();
-}
-
 function setMAVisibility(show) {
-  const v = show ? '' : 'none';
-  EL.maSection.style.display = v;
-  EL.ma200stat.style.display = v;
-  EL.ma150stat.style.display = v;
-  EL.ma50stat.style.display  = v;
+  document.getElementById('ma-section').style.display = show ? '' : 'none';
+  for (const id of ['ma200-stat', 'ma150-stat', 'ma50-stat'])
+    document.getElementById(id).style.display = show ? '' : 'none';
 }
 
-// Main load.
-// preserve=true (auto-refresh): keeps savedExtremes so the view is restored after redraw.
-// preserve=false (user action): clears savedExtremes so chart opens at its default range.
-async function load(preserve = false) {
+// ── Main load ──────────────────────────────────────────────────────────────
+async function load() {
   const sym    = document.getElementById('symbol').value;
   const period = document.getElementById('period').value;
   if (!sym || !period) return;
   showError('');
 
-  if (!preserve) savedExtremes = null;
-
   const isDaily = period === 'daily';
   const tzOff   = getTZOffsetMs();
-  setMAVisibility(isDaily);
+  setMAVisibility(true);
+  document.getElementById('ext-section').style.display = isDaily ? 'none' : '';
 
+  // Fetch price data and MA file in parallel
   const [mainText, maText] = await Promise.all([
     fetchText(`${sym}_${period}.csv`),
-    isDaily ? fetchText(`${sym}_ma.csv`) : Promise.resolve(null)
+    fetchText(isDaily ? `${sym}_ma.csv` : `${sym}_ma_minute.csv`)
   ]);
 
   if (!mainText) { showError('No data for ' + sym); return; }
 
-  const rows = sliceLastDays(parseCSVFast(mainText), 30);
+  // Slice minute data to last 30 days (daily is small enough to show in full)
+  const allRows = parseCSVFast(mainText);
+  const rows = isDaily ? allRows : sliceLastDays(allRows, 30);
 
-  // Pre-allocated arrays filled by index
-  const ohlc   = new Array(rows.length);
-  const volume = new Array(rows.length);
+  // Build OHLCV — filter pre/post market (volume=0) unless toggled on
+  // Row layout: [ts, open, close, high, low, volume]
+  // Highcharts candlestick wants: [ts, open, high, low, close]
+  const ohlc = [], volume = [];
   for (let i = 0; i < rows.length; i++) {
-    const r  = rows[i];
+    const r = rows[i];
+    if (!isDaily && !showExtMarket && r[5] === 0) continue;
     const ts = r[0] - tzOff;
-    ohlc[i]   = [ts, r[1], r[3], r[4], r[2]]; // open, high, low, close
-    volume[i] = [ts, r[5]];
+    ohlc.push([ts, r[1], r[3], r[4], r[2]]);
+    volume.push([ts, r[5]]);
   }
 
-  // Single-pass MA parse
-  const { ma200: ma200data, ma150: ma150data, ma50: ma50data, latest: latestMA }
-    = isDaily ? buildMAData(maText) : { ma200: [], ma150: [], ma50: [], latest: null };
+  // MA series (both daily and minute have MA files)
+  const ma200data = [], ma150data = [], ma50data = [];
+  let latestMA = null;
+
+  if (maText) {
+    for (const r of parseMACSV(maText)) {
+      const ts = r[0] - tzOff;
+      if (r[1] > 0) ma200data.push([ts, r[1]]);
+      if (r[2] > 0) ma150data.push([ts, r[2]]);
+      if (r[3] > 0) ma50data.push([ts, r[3]]);
+      latestMA = r;
+    }
+  }
 
   // Stats strip
-  const last = rows[rows.length - 1];
-  const prev = rows[rows.length - 2];
-
-  EL.symbol.textContent = sym.toUpperCase() + ' \xb7 ' + period;
+  const last = rows.at(-1), prev = rows.at(-2);
+  document.getElementById('st-symbol').textContent = sym.toUpperCase() + ' - ' + period;
 
   if (last) {
     const close = last[2], prevClose = prev?.[2];
-    EL.price.textContent = fmtNum(close);
-    EL.price.className   = 'stat-value' + (prevClose != null ? (close >= prevClose ? ' up' : ' down') : '');
-    EL.vol.textContent   = fmtVol(last[5]);
+    const priceEl = document.getElementById('st-price');
+    priceEl.textContent = fmtNum(close);
+    priceEl.className   = 'stat-value' + (prevClose != null ? (close >= prevClose ? ' up' : ' down') : '');
+    document.getElementById('st-vol').textContent = fmtVol(last[5]);
   }
 
-  if (isDaily && latestMA) {
-    EL.ma200.textContent = latestMA[1] > 0 ? fmtNum(latestMA[1]) : '-';
-    EL.ma150.textContent = latestMA[2] > 0 ? fmtNum(latestMA[2]) : '-';
-    EL.ma50.textContent  = latestMA[3] > 0 ? fmtNum(latestMA[3]) : '-';
+  if (latestMA) {
+    document.getElementById('st-ma200').textContent = latestMA[1] > 0 ? fmtNum(latestMA[1]) : '-';
+    document.getElementById('st-ma150').textContent = latestMA[2] > 0 ? fmtNum(latestMA[2]) : '-';
+    document.getElementById('st-ma50').textContent  = latestMA[3] > 0 ? fmtNum(latestMA[3]) : '-';
   }
 
-  if (Highcharts.charts[0]) Highcharts.charts[0].destroy();
+  // Chart — save xAxis range so auto-refresh doesn't reset the view
+  let savedRange = null;
+  const existing = Highcharts.charts.find(Boolean);
+  if (existing) {
+    const ex = existing.xAxis[0].getExtremes();
+    if (ex.min > ex.dataMin || ex.max < ex.dataMax)
+      savedRange = { min: ex.min, max: ex.max };
+    existing.destroy();
+  }
 
-  // Block afterSetExtremes while the chart initialises so it cannot overwrite
-  // savedExtremes with the brand-new chart's default range.
-  blockSave = true;
   const chart = Highcharts.stockChart('chart', {
     time:  { useUTC: true },
-    chart: {
-      backgroundColor: '#0d0d0f',
-      style: { fontFamily: "'Courier New', monospace" },
-      animation: false,
-      zooming: {
-        mouseWheel: { enabled: true, type: 'x' }
-      }
-    },
+    chart: { backgroundColor: '#0d0d0f', style: { fontFamily: "'Courier New', monospace" }, animation: false },
     title: { text: null },
     rangeSelector: {
-      enabled: true,
-      inputEnabled: true,
       selected: isDaily ? 5 : 4,
       buttons: isDaily
         ? [
-            { type: 'month', count: 1,  text: '1M'  },
-            { type: 'month', count: 3,  text: '3M'  },
-            { type: 'month', count: 6,  text: '6M'  },
-            { type: 'ytd',              text: 'YTD' },
-            { type: 'year',  count: 1,  text: '1Y'  },
-            { type: 'all',              text: 'All' }
+            { type: 'month', count: 1, text: '1M' },
+            { type: 'month', count: 3, text: '3M' },
+            { type: 'month', count: 6, text: '6M' },
+            { type: 'ytd',            text: 'YTD' },
+            { type: 'year',  count: 1, text: '1Y' },
+            { type: 'all',            text: 'All' }
           ]
         : [
-            { type: 'hour',  count: 1,  text: '1H'  },
-            { type: 'hour',  count: 4,  text: '4H'  },
-            { type: 'day',   count: 1,  text: '1D'  },
-            { type: 'week',  count: 1,  text: '1W'  },
-            { type: 'all',              text: 'All' }
+            { type: 'hour', count: 1, text: '1H' },
+            { type: 'hour', count: 4, text: '4H' },
+            { type: 'day',  count: 1, text: '1D' },
+            { type: 'week', count: 1, text: '1W' },
+            { type: 'all',           text: 'All' }
           ],
       buttonTheme: {
         fill: '#14141a', stroke: '#2a2a38', r: 2,
@@ -418,10 +386,8 @@ async function load(preserve = false) {
           select: { fill: '#5f9fff22', style: { color: '#5f9fff' } }
         }
       },
-      inputStyle:  { color: '#c8c8d0', backgroundColor: '#14141a', fontFamily: "'Courier New', monospace", fontSize: '12px' },
-      inputBoxBorderColor: '#2a2a38',
-      inputBoxWidth: 100,
-      labelStyle:  { color: '#555566' }
+      inputStyle: { color: '#c8c8d0', backgroundColor: '#14141a', fontFamily: "'Courier New', monospace" },
+      labelStyle: { color: '#555566' }
     },
     navigator: {
       enabled: true, maskFill: 'rgba(95,159,255,0.08)', outlineColor: '#2a2a38',
@@ -435,25 +401,11 @@ async function load(preserve = false) {
     },
     xAxis: {
       gridLineColor: '#1a1a24', lineColor: '#1e1e26', tickColor: '#1e1e26',
-      labels: { style: { color: '#555566', fontSize: '11px' } },
-      events: {
-        // Track every view change so auto-refresh can restore the exact position.
-        afterSetExtremes(e) {
-          if (!blockSave) savedExtremes = { min: e.min, max: e.max };
-        }
-      }
+      labels: { style: { color: '#555566', fontSize: '11px' } }
     },
     yAxis: [
-      {
-        labels: { style: { color: '#777788', fontSize: '11px' }, align: 'right', x: -6 },
-        gridLineColor: '#1a1a24', height: '68%',
-        resize: { enabled: true },
-        crosshair: { color: '#2a2a3844', dashStyle: 'Dot' }
-      },
-      {
-        labels: { style: { color: '#444456', fontSize: '10px' }, align: 'right', x: -6 },
-        gridLineColor: '#14141a', top: '73%', height: '27%', offset: 0
-      }
+      { labels: { style: { color: '#777788', fontSize: '11px' }, align: 'right', x: -6 }, gridLineColor: '#1a1a24', height: '68%', resize: { enabled: true }, crosshair: { color: '#2a2a3844', dashStyle: 'Dot' } },
+      { labels: { style: { color: '#444456', fontSize: '10px' }, align: 'right', x: -6 }, gridLineColor: '#14141a', top: '73%', height: '27%', offset: 0 }
     ],
     tooltip: {
       split: true, backgroundColor: '#14141a', borderColor: '#2a2a38', borderRadius: 3,
@@ -461,7 +413,7 @@ async function load(preserve = false) {
     },
     legend: {
       enabled: true, align: 'right', verticalAlign: 'top', layout: 'horizontal',
-      itemStyle:      { color: '#777788', fontFamily: "'Courier New', monospace", fontSize: '11px', fontWeight: '400' },
+      itemStyle: { color: '#777788', fontFamily: "'Courier New', monospace", fontSize: '11px', fontWeight: '400' },
       itemHoverStyle: { color: '#c8c8d0' }
     },
     plotOptions: {
@@ -469,98 +421,41 @@ async function load(preserve = false) {
       candlestick: { groupPadding: 0.05 }
     },
     series: [
-      {
-        type: 'candlestick', name: sym.toUpperCase(), data: ohlc, yAxis: 0,
-        upColor: '#26a69a', color: '#ef5350', upLineColor: '#26a69a', lineColor: '#ef5350',
-        showInLegend: false
-      },
-      {
-        type: 'column', name: 'Volume', data: volume, yAxis: 1,
-        color: 'rgba(95,159,255,0.25)', borderWidth: 0, showInLegend: false
-      },
+      { type: 'candlestick', name: sym.toUpperCase(), data: ohlc,      yAxis: 0, upColor: '#26a69a', color: '#ef5350', upLineColor: '#26a69a', lineColor: '#ef5350', showInLegend: false, ...(isDaily ? {} : { pointWidth: 3 }) },
+      { type: 'column',      name: 'Volume',          data: volume,    yAxis: 1, color: 'rgba(95,159,255,0.25)', borderWidth: 0, showInLegend: false, ...(isDaily ? {} : { pointWidth: 2 }) },
       { type: 'line', name: 'MA 200', data: ma200data, yAxis: 0, color: '#ff6b6b', lineWidth: 1.5, marker: { enabled: false }, visible: maVisible.ma200, enableMouseTracking: true, states: { hover: { lineWidthPlus: 0 } } },
       { type: 'line', name: 'MA 150', data: ma150data, yAxis: 0, color: '#ffa94d', lineWidth: 1.5, marker: { enabled: false }, visible: maVisible.ma150, enableMouseTracking: true, states: { hover: { lineWidthPlus: 0 } } },
       { type: 'line', name: 'MA 50',  data: ma50data,  yAxis: 0, color: '#69db7c', lineWidth: 1.5, marker: { enabled: false }, visible: maVisible.ma50,  enableMouseTracking: true, states: { hover: { lineWidthPlus: 0 } } }
     ],
     credits: { enabled: false }
   });
-  blockSave = false;
 
-  // Restore the view the user had before the auto-refresh redraw.
-  // setExtremes fires afterSetExtremes (blockSave is false now), which re-saves
-  // the same values - harmless.
-  if (savedExtremes) {
-    chart.xAxis[0].setExtremes(savedExtremes.min, savedExtremes.max, true, false);
-  }
+  if (savedRange) chart.xAxis[0].setExtremes(savedRange.min, savedRange.max, true, false);
 }
 
-// Keyboard navigation - arrow keys pan, +/- zoom
-document.addEventListener('keydown', e => {
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
-  const chart = Highcharts.charts[0];
-  if (!chart) return;
-
-  const xAxis = chart.xAxis[0];
-  const { min, max, dataMin, dataMax } = xAxis.getExtremes();
-  const range = max - min;
-  const step  = range * 0.2;
-
-  let newMin = min, newMax = max, handled = true;
-
-  switch (e.key) {
-    case 'ArrowLeft':
-      newMin = Math.max(dataMin, min - step);
-      newMax = newMin + range;
-      break;
-    case 'ArrowRight':
-      newMax = Math.min(dataMax, max + step);
-      newMin = newMax - range;
-      break;
-    case '+':
-    case '=': {
-      const z = range * 0.2;
-      if (range - z * 2 > 60_000) { newMin = min + z; newMax = max - z; }
-      break;
-    }
-    case '-': {
-      const z = range * 0.25;
-      newMin = Math.max(dataMin, min - z);
-      newMax = Math.min(dataMax, max + z);
-      break;
-    }
-    default:
-      handled = false;
-  }
-
-  if (handled) {
-    e.preventDefault();
-    xAxis.setExtremes(newMin, newMax, true, false);
-    // afterSetExtremes fires here and saves the new position to savedExtremes
-  }
-});
-
-// Auto-refresh - passes preserve=true so the current view is kept
+// ── Auto-refresh ───────────────────────────────────────────────────────────
 let countdown = 30;
 setInterval(() => {
-  EL.countdown.textContent = --countdown;
-  if (countdown <= 0) { countdown = 30; load(true); }
+  document.getElementById('countdown').textContent = --countdown;
+  if (countdown <= 0) { countdown = 30; load(); }
 }, 1000);
 
 function showError(msg) {
-  EL.error.style.display = msg ? 'block' : 'none';
-  EL.error.innerText = msg;
+  const el = document.getElementById('error');
+  el.style.display = msg ? 'block' : 'none';
+  el.innerText = msg;
 }
 
-// Init
+// ── Init ───────────────────────────────────────────────────────────────────
 async function init() {
   try {
     catalogue = await (await fetch('/list')).json();
     const sel  = document.getElementById('symbol');
     const frag = document.createDocumentFragment();
-    const ph   = document.createElement('option');
-    ph.value = '';
-    ph.text  = '-- select symbol --';
-    frag.appendChild(ph);
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.text  = '-- select symbol --';
+    frag.appendChild(placeholder);
     for (const { symbol } of catalogue) {
       const opt = document.createElement('option');
       opt.value = symbol;
@@ -569,7 +464,7 @@ async function init() {
     }
     sel.innerHTML = '';
     sel.appendChild(frag);
-  } catch (e) {
+  } catch(e) {
     showError('Could not load symbol list: ' + e.message);
   }
 }

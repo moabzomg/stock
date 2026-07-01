@@ -8,10 +8,12 @@ class H(SimpleHTTPRequestHandler):
             for f in os.listdir('.'):
                 if f.endswith('_daily.csv'):
                     sym = f[:-10]
-                    symbols.setdefault(sym, []).append('daily')
+                    if '_ma' not in sym.lower():
+                        symbols.setdefault(sym, []).append('daily')
                 elif f.endswith('_minute.csv'):
                     sym = f[:-11]
-                    symbols.setdefault(sym, []).append('minute')
+                    if '_ma' not in sym.lower():
+                        symbols.setdefault(sym, []).append('minute')
             result = [
                 {'symbol': sym, 'periods': sorted(periods)}
                 for sym, periods in sorted(symbols.items())

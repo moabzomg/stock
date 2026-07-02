@@ -2,6 +2,13 @@
 """
 minute_extract.py — Fetch 1-min historical bars from IB.
 
+Files are year-partitioned under data/<year>/:
+    data/<year>/<SYMBOL>_minute_<year>.csv
+    data/<year>/<SYMBOL>_daily_<year>.csv
+
+Only the year file(s) that actually received new/changed bars this run are
+rewritten — older, untouched years are left alone.
+
 Usage:
     python3 minute_extract.py <SYMBOL> <YYYYMMDDHHmm>      # single symbol
     python3 minute_extract.py <YYYYMMDDHHmm> [-w FILE]     # all symbols in watchlist
@@ -29,24 +36,16 @@ _MA_MOD = None
 
 def _get_ma_mod():
     """
-    Load ma.py from the parent directory (../ma.py relative to this file),
-    matching where the file actually lives.
-
-    IMPORTANT: we only assign to the module-level cache (_MA_MOD) *after*
-    exec_module succeeds. Previously module_from_spec() populated _MA_MOD
-    immediately, so if exec_module() then raised (e.g. wrong path), the
-    global was left pointing at an empty, half-initialized module. Every
-    later call saw "_MA_MOD is not None" and skipped reloading, silently
-    reusing that broken module for the rest of the run (this is why the
-    first symbol failed with FileNotFoundError but every symbol after it
-    failed with a different, misleading "module 'ma' has no attribute
-    ..." error).
+    Load ma_minute.py from the same directory as this file.
+    Only assigns to the module-level cache after exec_module() succeeds, so
+    a load failure doesn't poison every later symbol in the run with a
+    half-initialized module.
     """
     global _MA_MOD
     if _MA_MOD is None:
         here = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.normpath(os.path.join(here, "..", "ma.py"))
-        spec = importlib.util.spec_from_file_location("ma", path)
+        path = os.path.join(here, "ma_minute.py")
+        spec = importlib.util.spec_from_file_location("ma_minute", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)   # if this throws, _MA_MOD stays None
         _MA_MOD = mod
@@ -117,6 +116,23 @@ def make_contract(symbol):
     return c
 
 
+# ── Year-partitioned path helpers ─────────────────────────────────────────────
+
+def _year_dir(year):
+    return os.path.join(DATA_DIR, str(year))
+
+
+def _list_years():
+    if not os.path.isdir(DATA_DIR):
+        return []
+    return sorted(d for d in os.listdir(DATA_DIR)
+                  if d.isdigit() and os.path.isdir(os.path.join(DATA_DIR, d)))
+
+
+def _minute_path(symbol, year): return os.path.join(_year_dir(year), f"{symbol}_minute_{year}.csv")
+def _daily_path(symbol, year):  return os.path.join(_year_dir(year), f"{symbol}_daily_{year}.csv")
+
+
 # ── CSV helpers ───────────────────────────────────────────────────────────────
 
 def is_valid(bar):
@@ -129,50 +145,81 @@ def is_valid(bar):
 
 
 def load_minute(symbol):
-    path = os.path.join(DATA_DIR, f"{symbol}_minute.csv")
-    if not os.path.exists(path): return [], set()
-    with open(path, newline="") as f:
-        bars = [{"datetime": r["datetime"], "open": float(r["open"]),
-                 "close": float(r["close"]), "high": float(r["high"]),
-                 "low": float(r["low"]), "volume": float(r["volume"])}
-                for r in csv.DictReader(f)]
-    bars = [b for b in bars if is_valid(b)]
-    seen = {b["datetime"] for b in bars}
-    if bars: print(f"  [resume] {symbol}: {len(bars)} bars ({min(seen)} → {max(seen)})")
-    return bars, seen
+    """Merge minute bars across every year folder found on disk."""
+    all_bars = []
+    for year in _list_years():
+        path = _minute_path(symbol, year)
+        if not os.path.exists(path):
+            continue
+        with open(path, newline="") as f:
+            all_bars.extend({"datetime": r["datetime"], "open": float(r["open"]),
+                              "close": float(r["close"]), "high": float(r["high"]),
+                              "low": float(r["low"]), "volume": float(r["volume"])}
+                             for r in csv.DictReader(f))
+    all_bars = [b for b in all_bars if is_valid(b)]
+    seen = {b["datetime"] for b in all_bars}
+    if all_bars:
+        print(f"  [resume] {symbol}: {len(all_bars)} bars ({min(seen)} → {max(seen)})")
+    return all_bars, seen
 
 
-def save_minute(symbol, bars):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    path = os.path.join(DATA_DIR, f"{symbol}_minute.csv")
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=MINUTE_FIELDS, extrasaction="ignore")
-        w.writeheader(); w.writerows(bars)
-    print(f"  [saved] {symbol}: {len(bars)} minute bars")
+def save_minute(symbol, all_bars, years):
+    """Rewrite only the given years' minute files, using the full set of
+    bars for that year filtered out of all_bars. Years not in `years` are
+    left untouched on disk."""
+    if not years:
+        return
+    by_year = {}
+    for b in all_bars:
+        y = b["datetime"][:4]
+        if y in years:
+            by_year.setdefault(y, []).append(b)
+    for year in sorted(by_year):
+        bars_sorted = sorted(by_year[year], key=lambda b: b["datetime"])
+        d = _year_dir(year)
+        os.makedirs(d, exist_ok=True)
+        path = _minute_path(symbol, year)
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=MINUTE_FIELDS, extrasaction="ignore")
+            w.writeheader(); w.writerows(bars_sorted)
+        print(f"  [saved] {symbol} {year}: {len(bars_sorted)} minute bars")
 
 
 def load_daily(symbol):
-    path = os.path.join(DATA_DIR, f"{symbol}_daily.csv")
-    if not os.path.exists(path): return {}
-    with open(path, newline="") as f:
-        rows = {}
-        for r in csv.DictReader(f):
-            rows[r["datetime"]] = {"datetime": r["datetime"], "open": float(r["open"]),
-                "close": float(r["close"]), "high": float(r["high"]),
-                "low": float(r["low"]), "volume": float(r["volume"]),
-                "status": r.get("status", "")}
+    """Merge daily bars across every year folder found on disk."""
+    rows = {}
+    for year in _list_years():
+        path = _daily_path(symbol, year)
+        if not os.path.exists(path):
+            continue
+        with open(path, newline="") as f:
+            for r in csv.DictReader(f):
+                rows[r["datetime"]] = {"datetime": r["datetime"], "open": float(r["open"]),
+                    "close": float(r["close"]), "high": float(r["high"]),
+                    "low": float(r["low"]), "volume": float(r["volume"]),
+                    "status": r.get("status", "")}
     return rows
 
 
-def save_daily(symbol, rows):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    path = os.path.join(DATA_DIR, f"{symbol}_daily.csv")
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=DAILY_FIELDS, extrasaction="ignore")
-        w.writeheader()
-        for r in sorted(rows.values(), key=lambda r: r["datetime"]):
-            if "status" not in r: r = {**r, "status": ""}
-            w.writerow(r)
+def save_daily(symbol, rows, years):
+    """Rewrite only the given years' daily files out of the merged `rows` dict."""
+    if not years:
+        return
+    by_year = {}
+    for dt, r in rows.items():
+        y = dt[:4]
+        if y in years:
+            by_year.setdefault(y, []).append(r)
+    for year in sorted(by_year):
+        d = _year_dir(year)
+        os.makedirs(d, exist_ok=True)
+        path = _daily_path(symbol, year)
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=DAILY_FIELDS, extrasaction="ignore")
+            w.writeheader()
+            for r in sorted(by_year[year], key=lambda r: r["datetime"]):
+                if "status" not in r: r = {**r, "status": ""}
+                w.writerow(r)
 
 
 def market_close_utc():
@@ -199,18 +246,13 @@ def _aggregate_day(date_str, day_bars, is_final):
 def update_daily_bars(symbol, all_bars):
     """
     Build/refresh daily bars for every date that has minute data but does
-    not yet have a *finalized* daily bar on disk.
+    not yet have a *finalized* daily bar on disk. Driven by "what's on disk
+    missing a final daily bar", not "what did we fetch this run", so a
+    small incremental fetch still catches up any backlog left over from
+    earlier failed runs. Historical days are always final; today's bar is
+    final only once we're past NYSE close.
 
-    This is intentionally driven by "what's on disk missing a final daily
-    bar", not "what did we fetch this run" — otherwise a small incremental
-    fetch (e.g. just today's few new minutes) never goes back and backfills
-    older days whose daily/MA aggregation failed or was skipped previously.
-    Historical days (before the current UTC calendar day) are always
-    final, since the trading day is over. Today's bar is final only once
-    we're past NYSE close.
-
-    Returns the sorted list of date strings written, or [] if nothing
-    changed.
+    Returns the sorted list of date strings written, or [] if nothing changed.
     """
     now_utc   = datetime.now(timezone.utc)
     today_str = now_utc.strftime("%Y%m%d")
@@ -233,7 +275,8 @@ def update_daily_bars(symbol, all_bars):
         written.append(date_str)
 
     if written:
-        save_daily(symbol, daily)
+        years_written = {d[:4] for d in written}
+        save_daily(symbol, daily, years_written)
     return written
 
 
@@ -267,6 +310,7 @@ def extract_symbol(app, symbol, start_dt, now_utc):
             print(f"  [{symbol}] gap: {gs:%Y-%m-%d} → {ge:%Y-%m-%d}")
 
     contract = make_contract(symbol)
+    years_touched = set()
     for gap_start, gap_end in gaps:
         chunk_end  = gap_end
         last_first = None
@@ -285,36 +329,38 @@ def extract_symbol(app, symbol, start_dt, now_utc):
                 bdt = datetime.strptime(b["datetime"], "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
                 if bdt >= start_dt and b["datetime"] not in seen and is_valid(b):
                     seen.add(b["datetime"]); all_bars.append(b)
+                    years_touched.add(b["datetime"][:4])
             chunk_end -= timedelta(days=1)
         else:
             continue
         break
 
     new_count = len(all_bars) - before
-    if all_bars:
-        all_bars.sort(key=lambda b: b["datetime"])
-        save_minute(symbol, all_bars)
-        print(f"  [{symbol}] +{new_count} new bars, {len(all_bars)} total")
 
-        # Aggregate daily bars for every date that has minute data but no
-        # finalized daily bar yet — this backfills any historical days left
-        # over from earlier failed runs, not just what was fetched now.
+    if years_touched:
+        all_bars.sort(key=lambda b: b["datetime"])
+        save_minute(symbol, all_bars, years_touched)
+        print(f"  [{symbol}] +{new_count} new bars, {len(all_bars)} total")
+    elif all_bars:
+        print(f"  [{symbol}] no new minute bars")
+
+    if all_bars:
+        # Backfill/finalize daily bars for any date missing a final entry —
+        # cheap even with no new minute bars (e.g. flipping today's bar
+        # from live to final once market close has passed).
         updated_dates = update_daily_bars(symbol, all_bars)
 
-        new_dates = sorted({b["datetime"][:8] for b in all_bars[len(all_bars) - new_count:]}) \
-                    if new_count else []
+        new_dates = {b["datetime"][:8] for b in all_bars[len(all_bars) - new_count:]} if new_count else set()
+        candidates = set(updated_dates) | new_dates
+        if candidates:
+            start_ma = min(candidates)
+            try:
+                ma = _get_ma_mod()
+                ma.compute_daily_ma(symbol, start_ma)
+                ma.compute_minute_ma(symbol, start_ma)
+            except Exception as e:
+                print(f"  [{symbol}] MA warning: {e}")
 
-        # MA needs to be (re)computed starting at the earliest date that
-        # either got new minute bars or a fresh/updated daily bar this run,
-        # so a small incremental fetch still catches up any MA backlog.
-        candidates = updated_dates + new_dates
-        start_ma = min(candidates) if candidates else all_bars[0]["datetime"][:8]
-        try:
-            ma = _get_ma_mod()
-            ma.compute_daily_ma(symbol, start_ma)
-            ma.compute_minute_ma(symbol, start_ma)
-        except Exception as e:
-            print(f"  [{symbol}] MA warning: {e}")
     return new_count
 
 

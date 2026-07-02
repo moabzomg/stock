@@ -630,9 +630,18 @@ def preflight(symbols):
         has_minute  = recent_days.issubset(set(minute_days))
 
         # Check for daily gaps even if we have MIN_DAILY_BARS
-        # (e.g. stopped for 5 days — recent days missing from daily CSV)
+        # (e.g. stopped for 5 days — recent days missing from daily CSV).
+        # Exclude BOTH the last completed trading day's successor logic AND
+        # today's actual calendar date — if the market is open right now,
+        # today's row can appear in `recent_days` (last_n_trading_days treats
+        # the current session as valid) even though IB/yfinance can't return
+        # a completed daily bar for it until after close. Without excluding
+        # today_actual here, preflight flags it as a "gap" and backfill_symbols
+        # wastes a full IB historical request trying to fetch a bar that
+        # doesn't exist yet.
+        today_actual = now_utc.strftime("%Y%m%d")
         missing_recent_daily = [d for d in sorted(recent_days)
-                                 if d != today_str
+                                 if d != today_str and d != today_actual
                                  and daily_rows.get(d, {}).get("status") != "final"]
 
         ok = has_daily and has_minute and not missing_recent_daily

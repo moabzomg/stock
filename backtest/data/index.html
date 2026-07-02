@@ -290,10 +290,12 @@ async function load() {
   setMAVisibility(true);
   document.getElementById('ext-section').style.display = isDaily ? 'none' : '';
 
-  // Fetch price data and MA file in parallel
+  // Fetch price data and MA file in parallel via server concat endpoints
+  const entry = catalogue.find(e => e.symbol === sym);
+  const priceFiles = (entry?.files?.[period] ?? []).join(',');
   const [mainText, maText] = await Promise.all([
-    fetchText(`${sym}_${period}.csv`),
-    fetchText(isDaily ? `${sym}_ma.csv` : `${sym}_ma_minute.csv`)
+    priceFiles ? fetchText(`/concat?files=${priceFiles}`) : Promise.resolve(null),
+    fetchText(`/ma?sym=${sym}&period=${period}`)
   ]);
 
   if (!mainText) { showError('No data for ' + sym); return; }

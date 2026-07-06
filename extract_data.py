@@ -35,6 +35,8 @@ DAILY_CHUNK_DURATION = "1 Y"
 MINUTE_CHUNK_DURATION= "1 D"
 WHAT_TO_SHOW         = "TRADES"
 USE_RTH              = 0
+USE_RTH_DAILY        = 1
+IB_STOCK_VOLUME_MULTIPLIER = float(os.environ.get("IB_STOCK_VOLUME_MULTIPLIER", "100"))
 YF_MAX_MINUTE_DAYS   = 7
 POST_MARKET_HOURS    = 4          # keep polling this many hours past RTH close (extended hours)
 PRE_MARKET_HOURS     = 4          # start polling this many hours before RTH open (extended hours)
@@ -43,6 +45,23 @@ MINUTE_FIELDS = ["datetime","open","close","high","low","volume"]
 _IB_SESSION_LOCK = threading.Lock()
 _CALENDAR        = None
 _MA_MOD          = None          # cached ma module
+
+# Minimum 1-min bars expected on disk for a trading day before we consider
+# it "complete" rather than a candidate for intraday-gap backfill. A full
+# RTH session is ~390 bars; this threshold is intentionally loose (holidays,
+# half-days, thin symbols, and legitimate short outages can all dip below
+# 390 without being a real hole) but still catches a multi-minute poller
+# stall, which previously went completely undetected — see
+# compute_minute_gaps().
+MIN_EXPECTED_MINUTE_BARS = 300
+
+# A single minute bar's volume this many multiples above the symbol's own
+# recent per-minute median is logged (not rejected — a closing auction or a
+# genuine news spike can look exactly like this). The pipeline previously
+# had no upper-bound sanity check on volume at all, so a scaling/duplication
+# bug would sail through silently. See _check_volume_outliers().
+VOLUME_OUTLIER_MULTIPLE   = 15
+VOLUME_OUTLIER_FLOOR      = 500_000   # ignore tiny symbols where 15x of a tiny median is still noise
 
 
 def _get_calendar():
@@ -72,6 +91,15 @@ def _path(symbol, kind):
     return os.path.join(DATA_DIR, f"{symbol}_{kind}.csv")
 
 
+def _status_to_int(s):
+    """status column: 0 = live/in-progress, 1 = final. Accepts legacy
+    'final'/'live' strings too, so files written before this change still
+    load correctly."""
+    if s in (1, "1", "final"):
+        return 1
+    return 0
+
+
 def _load_csv(path, fields):
     if not os.path.exists(path):
         return {}
@@ -80,8 +108,10 @@ def _load_csv(path, fields):
         for r in csv.DictReader(f):
             row = {}
             for k in fields:
-                if k in ("datetime", "status"):
+                if k == "datetime":
                     row[k] = r.get(k, "")
+                elif k == "status":
+                    row[k] = _status_to_int(r.get(k, 0))
                 else:
                     try:
                         row[k] = float(r[k])
@@ -97,8 +127,8 @@ def _write_csv(path, rows, fields):
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         for r in sorted(rows.values(), key=lambda r: r["datetime"]):
-            if "status" in fields and "status" not in r:
-                r = {**r, "status": ""}
+            if "status" in fields:
+                r = {**r, "status": _status_to_int(r.get("status", 0))}
             w.writerow(r)
 
 
@@ -146,14 +176,41 @@ def is_valid(bar):
         return False
 
 
-def collapse_to_daily(symbol, minute_rows, status="live"):
-    """Build today's daily bar from minute rows. Returns bar dict or None."""
-    today = datetime.now(timezone.utc).strftime("%Y%m%d")
-    bars  = sorted((v for k, v in minute_rows.items() if k[:8] == today),
+def _check_volume_outliers(symbol, new_bars, minute_cache):
+    """Log (never reject) minute bars whose volume is a large multiple of
+    this symbol's own recent per-minute volume.
+
+    is_valid() has no upper bound on volume — by design, since a real spike
+    (a closing-auction print, a news-driven surge) is legitimate data and
+    shouldn't be silently dropped. But that also means a scaling bug, a
+    duplicated/misattributed print, or a vendor-side glitch currently sails
+    through with zero visibility. This just surfaces it in the logs so it's
+    catchable without having to run compare_backtest.py after the fact.
+    """
+    history = sorted(minute_cache.get(symbol, {}).values(), key=lambda b: b["datetime"])
+    if len(history) < 5:
+        return
+    vols = sorted(b["volume"] for b in history[-30:])
+    median = vols[len(vols) // 2]
+    if median <= 0:
+        return
+    threshold = max(median * VOLUME_OUTLIER_MULTIPLE, VOLUME_OUTLIER_FLOOR)
+    for dt, bar in new_bars.items():
+        if bar["volume"] > threshold:
+            print(f"  [volume-outlier] {symbol} {dt}: volume={bar['volume']:.0f} "
+                  f"vs recent per-minute median={median:.0f} (>{VOLUME_OUTLIER_MULTIPLE}x) — "
+                  f"could be a genuine spike (e.g. closing auction) or a bad print; "
+                  f"worth checking against IB/compare_backtest.py")
+
+
+def collapse_to_daily(symbol, minute_rows, status=0, day=None):
+    """Build one daily bar from minute rows. Returns bar dict or None."""
+    day = day or datetime.now(timezone.utc).strftime("%Y%m%d")
+    bars  = sorted((v for k, v in minute_rows.items() if k[:8] == day),
                    key=lambda b: b["datetime"])
     if not bars:
         return None
-    return {"datetime": today, "open": bars[0]["open"], "close": bars[-1]["close"],
+    return {"datetime": day, "open": bars[0]["open"], "close": bars[-1]["close"],
             "high": max(b["high"] for b in bars), "low": min(b["low"] for b in bars),
             "volume": sum(b["volume"] for b in bars), "status": status}
 
@@ -163,13 +220,6 @@ def run_daily_ma(symbol, start_date=None):
         _get_ma_mod().compute_daily_ma(symbol, start_date)
     except Exception as e:
         print(f"  [ma] {symbol}: {e}")
-
-
-def run_minute_ma(symbol, start_dt=None):
-    try:
-        _get_ma_mod().compute_minute_ma(symbol, start_dt)
-    except Exception as e:
-        print(f"  [ma_min] {symbol}: {e}")
 
 
 # ── Calendar helpers ──────────────────────────────────────────────────────────
@@ -291,7 +341,8 @@ def make_ib_app():
                     raw2   = raw.replace(" ", "")
                     fmt_dt = datetime.strptime(raw2[:14], "%Y%m%d%H%M%S").strftime("%Y%m%d%H%M")
             self._bars.append({"datetime": fmt_dt, "open": bar.open, "close": bar.close,
-                                "high": bar.high, "low": bar.low, "volume": bar.volume})
+                                "high": bar.high, "low": bar.low,
+                                "volume": normalize_ib_volume(bar.volume)})
 
         def historicalDataEnd(self, reqId, start, end): self._done.set()
 
@@ -318,13 +369,13 @@ def make_ib_app():
                 if elapsed < INTER_REQUEST_SLEEP: time.sleep(INTER_REQUEST_SLEEP - elapsed)
             self._ts.append(time.time())
 
-        def fetch(self, contract, end_dt, duration, bar_size):
+        def fetch(self, contract, end_dt, duration, bar_size, use_rth=USE_RTH):
             self._bars, self._error, self._bar_size = [], False, bar_size
             self._done.clear(); self._pace()
             end_str = end_dt.strftime("%Y%m%d-%H:%M:%S")
             print(f"  [ib] {bar_size} end={end_str} ...", end="", flush=True)
             self.reqHistoricalData(self._req_id, contract, end_str, duration,
-                                   bar_size, WHAT_TO_SHOW, USE_RTH, 2, 0, [])
+                                   bar_size, WHAT_TO_SHOW, use_rth, 2, 0, [])
             self._req_id += 1
             if not self._done.wait(timeout=180):
                 print(" TIMEOUT"); self.cancelHistoricalData(self._req_id-1); return []
@@ -339,6 +390,18 @@ def make_contract(symbol):
     c = Contract()
     c.symbol, c.secType, c.exchange, c.currency = symbol.upper(), "STK", "SMART", "USD"
     return c
+
+
+def normalize_ib_volume(volume):
+    """Convert IB stock historical volume to shares.
+
+    IB often reports US stock historical volume in round lots. Set
+    IB_STOCK_VOLUME_MULTIPLIER=1 if your IB feed already returns shares.
+    """
+    try:
+        return float(volume) * IB_STOCK_VOLUME_MULTIPLIER
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class IBSession:
@@ -373,12 +436,12 @@ def ib_fetch_daily(app, contract, start_dt, end_dt):
     result       = {}
     chunk_end    = end_dt
     while chunk_end > start_dt:
-        bars = app.fetch(contract, chunk_end, DAILY_CHUNK_DURATION, "1 day")
+        bars = app.fetch(contract, chunk_end, DAILY_CHUNK_DURATION, "1 day", USE_RTH_DAILY)
         if app._error: break
         for b in bars:
             day = b["datetime"]
             if len(day) == 8 and start_str <= day <= end_str and day in trading_days:
-                b["status"] = "final"
+                b["status"] = 1
                 result[day] = b
         chunk_end -= timedelta(days=366)
     return result
@@ -466,11 +529,11 @@ def _parse_yf(df, symbols, dt_fmt):
 
 # ── Gap computation ───────────────────────────────────────────────────────────
 
-def compute_daily_gaps(symbol, today_str, start_date):
+def compute_daily_gaps(symbol, today_str, start_date, force_refresh=False):
     """Return list of missing daily trading days (excluding today — built from minutes).
-    Any bar already marked final is skipped. Non-final bars are re-checked."""
+    Any bar already marked final is skipped unless force_refresh=True."""
     daily_rows = load_daily(symbol)
-    final_days = {k for k, v in daily_rows.items() if v.get("status") == "final"}
+    final_days = set() if force_refresh else {k for k, v in daily_rows.items() if v.get("status") == 1}
     start_dt   = datetime.strptime(start_date, "%Y%m%d")
     all_td     = trading_days_between(start_dt.date(), today_str)
     missing    = [d for d in all_td if d != today_str and d not in final_days]
@@ -478,17 +541,47 @@ def compute_daily_gaps(symbol, today_str, start_date):
 
 
 def compute_minute_gaps(symbol, recent_days):
-    """Return list of recent trading days missing from minute CSV.
-    Only checks the most recent MINUTE_DAYS days — older minute data not needed."""
-    minute_rows   = load_minute(symbol)
-    existing_days = {k[:8] for k in minute_rows}
-    target_days   = sorted(recent_days)[-MINUTE_DAYS:]
-    return [d for d in target_days if d not in existing_days]
+    """Return list of recent trading days that need a (re)fetch from source:
+    either entirely missing from the minute CSV, or present but with an
+    intraday hole (a mid-session outage dropped part of the day).
+
+    Previously this only checked whether a day was *completely* absent, so
+    a day that has some bars but is missing a chunk in the middle (e.g. the
+    poller stalled or a couple of yfinance polls came back empty) was
+    silently treated as "done" forever — the hole never got backfilled by
+    preflight/backfill_symbols even though IB can trivially fill it, because
+    those functions only re-fetch days that appear in this list.
+
+    A day is flagged if its bar count on disk falls below
+    MIN_EXPECTED_MINUTE_BARS. That's a loose heuristic (holidays, half
+    sessions, and thin symbols can legitimately have fewer bars) but it's
+    strictly better than never checking at all, and false positives just
+    cost an extra IB request that confirms the day is fine.
+
+    Only checks the most recent MINUTE_DAYS days — older minute data not needed.
+    """
+    minute_rows = load_minute(symbol)
+    counts = {}
+    for k in minute_rows:
+        d = k[:8]
+        counts[d] = counts.get(d, 0) + 1
+
+    target_days = sorted(recent_days)[-MINUTE_DAYS:]
+    missing = []
+    for d in target_days:
+        count = counts.get(d, 0)
+        if count == 0:
+            missing.append(d)
+        elif count < MIN_EXPECTED_MINUTE_BARS:
+            print(f"  [gap] {symbol} {d}: only {count} minute bar(s) on disk "
+                  f"(< {MIN_EXPECTED_MINUTE_BARS} expected) — flagging for re-fetch")
+            missing.append(d)
+    return missing
 
 
 # ── Historical backfill ───────────────────────────────────────────────────────
 
-def backfill_symbols(symbols, today_str, recent_days, start_date=None):
+def backfill_symbols(symbols, today_str, recent_days, start_date=None, force_refresh=False):
     """Gap-fill daily + minute data for all symbols using IB."""
     now_utc    = datetime.now(timezone.utc)
     end_dt     = datetime.strptime(today_str, "%Y%m%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
@@ -504,7 +597,7 @@ def backfill_symbols(symbols, today_str, recent_days, start_date=None):
             min(k[:8] for k in all_ex) if all_ex else cal_start)
         s_date      = min(s_date, cal_start)
 
-        miss_daily  = compute_daily_gaps(sym, today_str, s_date)
+        miss_daily  = compute_daily_gaps(sym, today_str, s_date, force_refresh=force_refresh)
         miss_minute = compute_minute_gaps(sym, list(recent_days))
         sym_gaps[sym] = {"miss_daily": miss_daily, "miss_minute": miss_minute,
                          "daily_rows": daily_rows, "minute_rows": minute_rows}
@@ -538,11 +631,15 @@ def backfill_symbols(symbols, today_str, recent_days, start_date=None):
         # Fill recent daily gaps from yfinance
         for day, bar in yf_daily.get(sym, {}).items():
             if day in set(gap["miss_daily"]):
-                bar["status"] = "final"
+                bar["status"] = 1
                 gap["daily_rows"][day] = bar
                 gap["miss_daily"] = [d for d in gap["miss_daily"] if d != day]
 
-        # Fill minute gaps from yfinance
+        # Fill minute gaps from yfinance. Note this uses dict .update(), so
+        # for a day that's flagged due to a partial intraday hole (rather
+        # than being fully absent), any bars already on disk for that day
+        # are preserved and only the missing timestamps effectively change —
+        # existing good bars just get overwritten with the same values.
         fresh_days = sorted({k[:8] for k in yf_minute.get(sym, {})})
         target     = set(fresh_days[-MINUTE_DAYS:])
         for k, v in yf_minute.get(sym, {}).items():
@@ -577,6 +674,12 @@ def backfill_symbols(symbols, today_str, recent_days, start_date=None):
                         print(f"  [ib] {sym}: +{len(filtered)} daily bars")
                     if gap["miss_minute"]:
                         lo = datetime.strptime(min(gap["miss_minute"]), "%Y%m%d").replace(tzinfo=timezone.utc)
+                        # IB is requested for the *whole* day range covering every
+                        # flagged day (not just fully-missing ones), so a day that
+                        # was flagged for an intraday hole gets its missing minutes
+                        # merged in here via dict update — bars already on disk for
+                        # that day are simply overwritten with the same IB values,
+                        # and the previously-missing timestamps get filled in.
                         fetched = {k: v for k, v in ib_fetch_minute(app, contract, lo, end_dt).items()
                                    if k[:8] in set(gap["miss_minute"])}
                         gap["minute_rows"].update(fetched)
@@ -590,8 +693,6 @@ def backfill_symbols(symbols, today_str, recent_days, start_date=None):
         save_minute(sym, gap["minute_rows"])
         if gap["daily_rows"]:
             run_daily_ma(sym, sorted(gap["daily_rows"])[0])
-        if gap["minute_rows"]:
-            run_minute_ma(sym, sorted(gap["minute_rows"])[0])
         print(f"  [saved] {sym}: {len(gap['daily_rows'])} daily, "
               f"{len(gap['minute_rows'])} minute bars")
 
@@ -642,18 +743,26 @@ def preflight(symbols):
         today_actual = now_utc.strftime("%Y%m%d")
         missing_recent_daily = [d for d in sorted(recent_days)
                                  if d != today_str and d != today_actual
-                                 and daily_rows.get(d, {}).get("status") != "final"]
+                                 and daily_rows.get(d, {}).get("status") != 1]
+
+        # Also check for intraday minute holes on days that DO appear in
+        # minute_days — has_minute above only checks day-level coverage
+        # (a day with 1 bar out of ~390 still "counts"), so route through
+        # compute_minute_gaps() as well to catch partial-day gaps.
+        gappy_minute_days = compute_minute_gaps(sym, list(recent_days))
+        if gappy_minute_days:
+            has_minute = False
 
         ok = has_daily and has_minute and not missing_recent_daily
 
         range_str = f"[{daily_days[0]}-{daily_days[-1]}]" if daily_days else "[none]"
-        miss_min  = sorted(recent_days - set(minute_days))
+        miss_min  = sorted(set(recent_days - set(minute_days)) | set(gappy_minute_days))
         status    = "OK" if ok else "NEEDS BACKFILL"
         detail    = f"{n_daily} daily {range_str}"
         if not has_daily:
             detail += f" (need {MIN_DAILY_BARS - n_daily} more)"
         if miss_min:
-            detail += f" | minute MISSING {miss_min}"
+            detail += f" | minute MISSING/PARTIAL {miss_min}"
         if missing_recent_daily:
             detail += f" | daily gaps {missing_recent_daily}"
         print(f"  [{sym}] {status} | {detail}")
@@ -700,13 +809,21 @@ def poll_tick(symbols, minute_cache, now_utc, rth_close):
         new_bars = batch.get(sym, {})
         if not new_bars:
             continue
+
+        # Flag implausible volume prints before the cache is updated, so the
+        # "recent median" comparison doesn't include the bars being checked.
+        _check_volume_outliers(sym, new_bars, minute_cache)
+
         before = len(minute_cache[sym])
+        changed = sum(1 for dt, bar in new_bars.items()
+                      if minute_cache[sym].get(dt) != bar)
         minute_cache[sym].update(new_bars)
         added  = len(minute_cache[sym]) - before
-        if added > 0:
+        if changed > 0:
             save_minute(sym, minute_cache[sym])
             added_any = True
-            print(f"  [poll] {sym}: +{added} bar(s) ({now_utc:%H:%M:%S} UTC)")
+            print(f"  [poll] {sym}: +{added} new / {changed} changed bar(s) "
+                  f"({now_utc:%H:%M:%S} UTC)")
 
             # Update today's in-progress daily bar from minutes.
             # Only keep updating/writing it while we're still inside RTH —
@@ -715,17 +832,17 @@ def poll_tick(symbols, minute_cache, now_utc, rth_close):
             # (post_close_reconcile marks the bar 'final' from yfinance instead).
             is_final = now_utc >= rth_close
             if not is_final:
-                bar = collapse_to_daily(sym, minute_cache[sym], "live")
+                today_str = now_utc.strftime("%Y%m%d")
+                bar = collapse_to_daily(sym, minute_cache[sym], 0, today_str)
                 if bar:
                     daily_rows = load_daily(sym)
                     daily_rows[bar["datetime"]] = bar
                     save_daily(sym, daily_rows)
 
-            # Update MAs in background
+            # Update daily MA in background
             today_str = now_utc.strftime("%Y%m%d")
-            threading.Thread(target=lambda s=sym, t=today_str: (
-                run_daily_ma(s, t), run_minute_ma(s, t)
-            ), daemon=True).start()
+            threading.Thread(target=lambda s=sym, t=today_str: run_daily_ma(s, t),
+                              daemon=True).start()
 
     if not added_any:
         print(f"  [poll] no new bars ({now_utc:%H:%M:%S} UTC)")
@@ -763,18 +880,46 @@ def post_close_reconcile(symbols, minute_cache):
         updated    = []
         for dt_str, bar in daily_batch.get(sym, {}).items():
             if len(dt_str) == 8:
-                bar["status"] = "final"
+                bar["status"] = 1
                 daily_rows[dt_str] = bar
                 updated.append(dt_str)
         if updated:
             save_daily(sym, daily_rows)
             print(f"  [yf] {sym}: updated daily bars {updated}")
+        elif today_str:
+            fallback = collapse_to_daily(sym, minute_cache.get(sym, {}), 1, today_str)
+            if fallback:
+                daily_rows[today_str] = fallback
+                save_daily(sym, daily_rows)
+                print(f"  [minute-final] {sym}: finalized {today_str} from minute cache")
 
-    # 3. Final MAs for all symbols (no IB backfill here — preflight handles that)
+    # 3. Catch any remaining intraday minute holes with a targeted IB
+    # backfill — yfinance's own feed can have the same gap the poller did
+    # (e.g. if yfinance itself briefly dropped data), so this is a second,
+    # independent source rather than relying on step 1 alone.
+    recent_days = set(last_n_trading_days(MINUTE_DAYS, as_of=now_utc.date()))
+    still_gappy = {sym: compute_minute_gaps(sym, list(recent_days)) for sym in symbols}
+    still_gappy = {s: d for s, d in still_gappy.items() if d}
+    if still_gappy:
+        print(f"[post-close] {len(still_gappy)} symbol(s) still have minute gaps after "
+              f"yfinance reconcile — running targeted IB backfill ...")
+        end_dt = datetime.now(timezone.utc)
+        with _IB_SESSION_LOCK:
+            with IBSession() as app:
+                for sym, days in still_gappy.items():
+                    contract = make_contract(sym)
+                    lo = datetime.strptime(min(days), "%Y%m%d").replace(tzinfo=timezone.utc)
+                    fetched = {k: v for k, v in ib_fetch_minute(app, contract, lo, end_dt).items()
+                               if k[:8] in set(days)}
+                    if fetched:
+                        minute_cache[sym].update(fetched)
+                        save_minute(sym, minute_cache[sym])
+                        print(f"  [ib] {sym}: +{len(fetched)} minute bars filling {days}")
+
+    # 4. Final daily MA for all symbols
     print(f"[post-close] running final MAs ...")
     for sym in symbols:
         run_daily_ma(sym, today_str)
-        run_minute_ma(sym, today_str)
 
     print(f"[post-close] done — {len(symbols)} symbol(s) reconciled")
 
@@ -878,7 +1023,7 @@ def main():
         now_utc   = datetime.now(timezone.utc)
         today_str = last_completed_trading_day(now_utc)
         recent    = set(last_n_trading_days(MINUTE_DAYS, as_of=now_utc.date()))
-        backfill_symbols(symbols, today_str, recent, start_date=arg)
+        backfill_symbols(symbols, today_str, recent, start_date=arg, force_refresh=True)
     else:
         try:
             run_live(symbols)

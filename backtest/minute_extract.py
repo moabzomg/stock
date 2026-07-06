@@ -31,6 +31,7 @@ REQUEST_WINDOW_SECS  = 600
 DATA_DIR  = "data"
 DAILY_FIELDS  = ["datetime","open","close","high","low","volume","status"]
 MINUTE_FIELDS = ["datetime","open","close","high","low","volume"]
+IB_STOCK_VOLUME_MULTIPLIER = float(os.environ.get("IB_STOCK_VOLUME_MULTIPLIER", "100"))
 _MA_MOD = None
 
 
@@ -52,6 +53,18 @@ def _get_ma_mod():
     return _MA_MOD
 
 
+def normalize_ib_volume(volume):
+    """Convert IB's raw historical-bar volume (round lots for US stocks) to
+    shares. Validated against TWS's own chart: IB's reqHistoricalData returns
+    US stock volume in lots of 100, so without this every saved bar is 100x
+    too small versus what TWS/most other vendors display. Set
+    IB_STOCK_VOLUME_MULTIPLIER=1 if a given feed already returns shares."""
+    try:
+        return float(volume) * IB_STOCK_VOLUME_MULTIPLIER
+    except (TypeError, ValueError):
+        return 0.0
+
+
 # ── IB extractor ──────────────────────────────────────────────────────────────
 
 class IBExtractor(EWrapper, EClient):
@@ -68,7 +81,7 @@ class IBExtractor(EWrapper, EClient):
             dt = datetime.strptime(raw, "%Y%m%d %H:%M:%S").replace(tzinfo=timezone.utc)
         self._bars.append({"datetime": dt.strftime("%Y%m%d%H%M"), "open": bar.open,
                            "close": bar.close, "high": bar.high, "low": bar.low,
-                           "volume": bar.volume})
+                           "volume": normalize_ib_volume(bar.volume)})
 
     def historicalDataEnd(self, reqId, start, end): self._done.set()
 
@@ -144,6 +157,15 @@ def is_valid(bar):
         return False
 
 
+def _status_to_int(s):
+    """status column: 0 = live/in-progress, 1 = final. Accepts legacy
+    'final'/'live' strings too, so files written before this change still
+    load correctly."""
+    if s in (1, "1", "final"):
+        return 1
+    return 0
+
+
 def load_minute(symbol):
     """Merge minute bars across every year folder found on disk."""
     all_bars = []
@@ -197,7 +219,7 @@ def load_daily(symbol):
                 rows[r["datetime"]] = {"datetime": r["datetime"], "open": float(r["open"]),
                     "close": float(r["close"]), "high": float(r["high"]),
                     "low": float(r["low"]), "volume": float(r["volume"]),
-                    "status": r.get("status", "")}
+                    "status": _status_to_int(r.get("status", 0))}
     return rows
 
 
@@ -218,7 +240,7 @@ def save_daily(symbol, rows, years):
             w = csv.DictWriter(f, fieldnames=DAILY_FIELDS, extrasaction="ignore")
             w.writeheader()
             for r in sorted(by_year[year], key=lambda r: r["datetime"]):
-                if "status" not in r: r = {**r, "status": ""}
+                r = {**r, "status": _status_to_int(r.get("status", 0))}
                 w.writerow(r)
 
 
@@ -240,7 +262,7 @@ def _aggregate_day(date_str, day_bars, is_final):
             "high":  max(b["high"]   for b in day_bars),
             "low":   min(b["low"]    for b in day_bars),
             "volume": sum(b["volume"] for b in day_bars),
-            "status": "final" if is_final else "live"}
+            "status": 1 if is_final else 0}
 
 
 def update_daily_bars(symbol, all_bars):
@@ -267,7 +289,7 @@ def update_daily_bars(symbol, all_bars):
 
     written = []
     for date_str in sorted(bars_by_day):
-        if daily.get(date_str, {}).get("status") == "final":
+        if daily.get(date_str, {}).get("status") == 1:
             continue  # already finalized, nothing to do
         day_bars = sorted(bars_by_day[date_str], key=lambda b: b["datetime"])
         is_final = today_is_final if date_str == today_str else True
@@ -355,9 +377,7 @@ def extract_symbol(app, symbol, start_dt, now_utc):
         if candidates:
             start_ma = min(candidates)
             try:
-                ma = _get_ma_mod()
-                ma.compute_daily_ma(symbol, start_ma)
-                ma.compute_minute_ma(symbol, start_ma)
+                _get_ma_mod().compute_daily_ma(symbol, start_ma)
             except Exception as e:
                 print(f"  [{symbol}] MA warning: {e}")
 

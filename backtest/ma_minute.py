@@ -31,6 +31,22 @@ Usage:
     python3 ma_minute.py <SYMBOL> [start_yyyymmdd]                # daily MA only
     python3 ma_minute.py <SYMBOL> --minute [start_yyyymmddhhmm]    # minute MA only
     python3 ma_minute.py <SYMBOL> --both [start_yyyymmdd]          # both
+
+NOTE ON THE BACKTEST-VS-LIVE DISCREPANCY INVESTIGATION
+--------------------------------------------------------
+No bug was found in this file. It was checked and confirmed to be
+unaffected by the extractor issues fixed in minute_extract.py because:
+  - It reads daily.csv/minute.csv via csv.DictReader, i.e. by column
+    *name*, not position — so it's immune to any column-ordering issues in
+    the source files, and doesn't care that DAILY_FIELDS gained a
+    bar_count column.
+  - It has no independent notion of "which days are complete" — it simply
+    trusts whatever close values exist in the source files. Once
+    minute_extract.py's gap-detection/finalization fixes let a
+    previously-incomplete day get corrected, re-running compute_daily_ma /
+    compute_minute_ma from that date forward (which extract_symbol()
+    already does automatically) picks up the corrected values with no
+    changes needed here.
 """
 
 import sys, os, csv

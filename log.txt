@@ -1,0 +1,196 @@
+Comparing 5 symbol(s): AMZN, GOOGL, META, NVDA, TSLA
+Backtest year: 2026  (dir: backtest/data/2026)
+Tolerance: 0.01
+Filtering to key range: 202606010000 .. 202606020000
+
+======================================================================
+AMZN_daily.csv
+======================================================================
+  live:     data/AMZN_daily.csv
+  backtest: backtest/data/2026/AMZN_daily_2026.csv
+  shared keys compared: 2
+  ✗ 2 row(s) with discrepancies:
+
+    [datetime=20260601]
+        open: live=266.14 vs backtest=270.5
+        close: live=261.26 vs backtest=259.55
+        high: live=266.63 vs backtest=270.5
+        low: live=260.7 vs backtest=258.25
+        volume: live=31403700.0 vs backtest=38140000.0
+    [datetime=20260602]
+        open: live=257.16 vs backtest=259.1
+        close: live=256.52 vs backtest=256.27
+        volume: live=22483700.0 vs backtest=29439900.0
+
+======================================================================
+AMZN_minute.csv
+======================================================================
+  live:     data/AMZN_minute.csv
+  backtest: backtest/data/2026/AMZN_minute_2026.csv
+  shared keys compared: 0
+  keys only in BACKTEST (960): ['202606010800', '202606010801', '202606010802', '202606010803', '202606010804', '202606010805', '202606010806', '202606010807', '202606010808', '202606010809'] (+950 more)
+  ✓ no value discrepancies in shared rows
+
+======================================================================
+AMZN_ma.csv
+======================================================================
+  live:     data/AMZN_ma.csv
+  backtest: backtest/data/2026/AMZN_ma_2026.csv
+  shared keys compared: 2
+  (skipped 6 field value(s) that were -1 placeholders, not counted as discrepancies)
+  ✓ no value discrepancies in shared rows
+
+======================================================================
+GOOGL_daily.csv
+======================================================================
+  live:     data/GOOGL_daily.csv
+  backtest: backtest/data/2026/GOOGL_daily_2026.csv
+  shared keys compared: 2
+  ✗ 2 row(s) with discrepancies:
+
+    [datetime=20260601]
+        open: live=376.24 vs backtest=380.0
+        close: live=376.37 vs backtest=373.66
+        high: live=378.56 vs backtest=381.8
+        low: live=373.52 vs backtest=366.3
+        volume: live=30262900.0 vs backtest=43671200.0
+    [datetime=20260602]
+        open: live=366.6 vs backtest=369.18
+        close: live=361.85 vs backtest=362.99
+        volume: live=77253100.0 vs backtest=95883000.0
+
+======================================================================
+GOOGL_minute.csv
+======================================================================
+  live:     data/GOOGL_minute.csv
+  backtest: backtest/data/2026/GOOGL_minute_2026.csv
+  shared keys compared: 0
+  keys only in BACKTEST (960): ['202606010800', '202606010801', '202606010802', '202606010803', '202606010804', '202606010805', '202606010806', '202606010807', '202606010808', '202606010809'] (+950 more)
+  ✓ no value discrepancies in shared rows
+
+======================================================================
+GOOGL_ma.csv
+======================================================================
+  live:     data/GOOGL_ma.csv
+  backtest: backtest/data/2026/GOOGL_ma_2026.csv
+  shared keys compared: 2
+  (skipped 6 field value(s) that were -1 placeholders, not counted as discrepancies)
+  ✓ no value discrepancies in shared rows
+
+======================================================================
+META_daily.csv
+======================================================================
+  live:     data/META_daily.csv
+  backtest: backtest/data/2026/META_daily_2026.csv
+  shared keys compared: 2
+  ✗ 2 row(s) with discrepancies:
+
+    [datetime=20260601]
+        open: live=629.14 vs backtest=630.88
+        close: live=600.47 vs backtest=600.61
+        high: live=635.75 vs backtest=637.37
+        low: live=599.53 vs backtest=597.18
+        volume: live=50410400.0 vs backtest=58209800.0
+    [datetime=20260602]
+        open: live=603.2 vs backtest=605.0
+        close: live=597.63 vs backtest=600.1
+        volume: live=24469700.0 vs backtest=32209500.0
+
+======================================================================
+META_minute.csv
+======================================================================
+  live:     data/META_minute.csv
+  backtest: backtest/data/2026/META_minute_2026.csv
+  shared keys compared: 0
+  keys only in BACKTEST (960): ['202606010800', '202606010801', '202606010802', '202606010803', '202606010804', '202606010805', '202606010806', '202606010807', '202606010808', '202606010809'] (+950 more)
+  ✓ no value discrepancies in shared rows
+
+======================================================================
+META_ma.csv
+======================================================================
+  live:     data/META_ma.csv
+  backtest: backtest/data/2026/META_ma_2026.csv
+  shared keys compared: 2
+  (skipped 6 field value(s) that were -1 placeholders, not counted as discrepancies)
+  ✓ no value discrepancies in shared rows
+
+======================================================================
+NVDA_daily.csv
+======================================================================
+  live:     data/NVDA_daily.csv
+  backtest: backtest/data/2026/NVDA_daily_2026.csv
+  shared keys compared: 2
+  ✗ 2 row(s) with discrepancies:
+
+    [datetime=20260601]
+        open: live=215.73 vs backtest=215.77
+        close: live=224.36 vs backtest=223.97
+        high: live=224.87 vs backtest=224.99
+        low: live=215.7 vs backtest=214.3
+        volume: live=123676900.0 vs backtest=133667100.0
+    [datetime=20260602]
+        open: live=227.18 vs backtest=228.85
+        close: live=222.82 vs backtest=221.79
+        high: live=232.28 vs backtest=235.0
+        low: live=221.35 vs backtest=220.8
+        volume: live=116090900.0 vs backtest=142326300.0
+
+======================================================================
+NVDA_minute.csv
+======================================================================
+  live:     data/NVDA_minute.csv
+  backtest: backtest/data/2026/NVDA_minute_2026.csv
+  shared keys compared: 0
+  keys only in BACKTEST (960): ['202606010800', '202606010801', '202606010802', '202606010803', '202606010804', '202606010805', '202606010806', '202606010807', '202606010808', '202606010809'] (+950 more)
+  ✓ no value discrepancies in shared rows
+
+======================================================================
+NVDA_ma.csv
+======================================================================
+  live:     data/NVDA_ma.csv
+  backtest: backtest/data/2026/NVDA_ma_2026.csv
+  shared keys compared: 2
+  (skipped 6 field value(s) that were -1 placeholders, not counted as discrepancies)
+  ✓ no value discrepancies in shared rows
+
+======================================================================
+TSLA_daily.csv
+======================================================================
+  live:     data/TSLA_daily.csv
+  backtest: backtest/data/2026/TSLA_daily_2026.csv
+  shared keys compared: 2
+  ✗ 2 row(s) with discrepancies:
+
+    [datetime=20260601]
+        open: live=427.49 vs backtest=430.88
+        close: live=415.88 vs backtest=413.57
+        high: live=429.6 vs backtest=436.88
+        low: live=415.43 vs backtest=413.25
+        volume: live=79768900.0 vs backtest=93187400.0
+    [datetime=20260602]
+        open: live=418.22 vs backtest=416.5
+        close: live=423.74 vs backtest=421.84
+        low: live=413.65 vs backtest=411.81
+        volume: live=65809200.0 vs backtest=78194600.0
+
+======================================================================
+TSLA_minute.csv
+======================================================================
+  live:     data/TSLA_minute.csv
+  backtest: backtest/data/2026/TSLA_minute_2026.csv
+  shared keys compared: 0
+  keys only in BACKTEST (960): ['202606010800', '202606010801', '202606010802', '202606010803', '202606010804', '202606010805', '202606010806', '202606010807', '202606010808', '202606010809'] (+950 more)
+  ✓ no value discrepancies in shared rows
+
+======================================================================
+TSLA_ma.csv
+======================================================================
+  live:     data/TSLA_ma.csv
+  backtest: backtest/data/2026/TSLA_ma_2026.csv
+  shared keys compared: 2
+  (skipped 6 field value(s) that were -1 placeholders, not counted as discrepancies)
+  ✓ no value discrepancies in shared rows
+
+======================================================================
+TOTAL rows with discrepancies across all files: 10
+======================================================================

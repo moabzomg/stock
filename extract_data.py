@@ -11,11 +11,37 @@ regular-session close (not the extended-hours close).
 Usage:
     python3 extract_data.py                  # live mode
     python3 extract_data.py <YYYYMMDD>       # historical backfill, all symbols
+
+Logging:
+    All console output is also appended to log.txt (see the print() shim
+    below), so `python3 extract_data.py` alone is enough to keep a
+    persistent log — no need to pipe through `tee` separately.
 """
 
-import sys, os, csv, math, time, threading, subprocess, importlib.util
+import sys, os, csv, math, time, threading, subprocess, importlib.util, builtins
 from datetime import datetime, timedelta, timezone
 from collections import deque
+
+# ── Logging shim ──────────────────────────────────────────────────────────────
+# Mirrors every print() call to log.txt (append mode) in addition to stdout,
+# so backfill/live-loop runs keep a persistent record regardless of how the
+# script is invoked (nohup, systemd, a plain terminal, etc). Opened with
+# buffering=1 (line-buffered) so log.txt stays current even if the process
+# is killed mid-run.
+LOG_FILE = "log.txt"
+_log_fh = open(LOG_FILE, "a", buffering=1)
+_orig_print = builtins.print
+
+def _tee_print(*args, **kwargs):
+    _orig_print(*args, **kwargs)
+    file_kwargs = dict(kwargs)
+    file_kwargs.pop("flush", None)
+    file_kwargs["file"] = _log_fh
+    _orig_print(*args, **file_kwargs)
+
+builtins.print = _tee_print
+print(f"\n[log] session started {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC, "
+      f"logging to {os.path.abspath(LOG_FILE)}")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR           = 'data'
@@ -62,6 +88,19 @@ MIN_EXPECTED_MINUTE_BARS = 300
 # bug would sail through silently. See _check_volume_outliers().
 VOLUME_OUTLIER_MULTIPLE   = 15
 VOLUME_OUTLIER_FLOOR      = 500_000   # ignore tiny symbols where 15x of a tiny median is still noise
+
+# ── yfinance batching config ─────────────────────────────────────────────────
+# yfinance's multi-ticker download() spawns roughly one OS thread per ticker
+# when threads=True (its default). Calling it with the *entire* watchlist
+# (e.g. ~9700 symbols) exhausts the OS thread limit and raises
+# "RuntimeError: can't start new thread" partway through the batch — every
+# ticker after that point then fails too (seen as a wall of unrelated-looking
+# "Failed to get ticker ... curl: getaddrinfo() thread failed to start" and
+# bogus "possibly delisted" errors in the log, none of which reflect real
+# data problems). Chunking the ticker list and disabling yfinance's internal
+# threading keeps the OS thread count bounded regardless of watchlist size.
+YF_BATCH_CHUNK_SIZE = 150
+YF_CHUNK_SLEEP      = 1.0   # brief pause between chunks
 
 
 def _get_calendar():
@@ -313,6 +352,13 @@ def make_ib_app():
             self._done = threading.Event(); self._error = False
             self._ts   = deque()
             self._connected = threading.Event()   # set once nextValidId arrives
+            # Set when IB reports error 1100 (socket-level connectivity lost
+            # between TWS/Gateway and IB's servers). Historical-data requests
+            # made after this point would otherwise sit through the full
+            # 180s timeout one by one — potentially for hours across a large
+            # symbol list — so fetch() checks this and bails out instantly
+            # instead. Cleared again if IB reports 1102 (connectivity restored).
+            self._connection_lost = threading.Event()
 
         def nextValidId(self, orderId):
             """Called by IB once the API handshake is fully complete. This is the
@@ -348,7 +394,22 @@ def make_ib_app():
 
         def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
             if errorCode in (2104,2105,2106,2107,2108,2119,2150,2158): return
-            if errorCode in (162,321,1100,1101,1102,2110):
+            if errorCode == 1100:
+                # Socket-level connectivity between TWS/Gateway and IB's
+                # servers has dropped. Every request from here until 1102
+                # would otherwise just time out after 180s — flag it so
+                # fetch() can skip straight to "no data" instead.
+                print(f"  [ib] CONNECTION LOST (1100): {errorString}")
+                self._connection_lost.set()
+                self._error = True
+                self._done.set()
+                return
+            if errorCode == 1102:
+                print(f"  [ib] connection restored (1102): {errorString}")
+                self._connection_lost.clear()
+                self._done.set()
+                return
+            if errorCode in (162,321,1101,2110):
                 print(f"  [ib warn] {errorCode}: {errorString}"); self._done.set()
             else:
                 print(f"  [ib error] {errorCode}: {errorString}")
@@ -370,6 +431,9 @@ def make_ib_app():
             self._ts.append(time.time())
 
         def fetch(self, contract, end_dt, duration, bar_size, use_rth=USE_RTH):
+            if self._connection_lost.is_set():
+                # Fail fast instead of waiting 180s on a dead connection.
+                return []
             self._bars, self._error, self._bar_size = [], False, bar_size
             self._done.clear(); self._pace()
             end_str = end_dt.strftime("%Y%m%d-%H:%M:%S")
@@ -436,6 +500,8 @@ def ib_fetch_daily(app, contract, start_dt, end_dt):
     result       = {}
     chunk_end    = end_dt
     while chunk_end > start_dt:
+        if app._connection_lost.is_set():
+            break
         bars = app.fetch(contract, chunk_end, DAILY_CHUNK_DURATION, "1 day", USE_RTH_DAILY)
         if app._error: break
         for b in bars:
@@ -453,6 +519,8 @@ def ib_fetch_minute(app, contract, start_dt, end_dt):
     chunk_end = end_dt
     last_first = None
     while chunk_end > start_dt:
+        if app._connection_lost.is_set():
+            break
         bars = app.fetch(contract, chunk_end, MINUTE_CHUNK_DURATION, "1 min")
         if app._error: break
         if bars:
@@ -478,29 +546,88 @@ def _yf():
         sys.exit("pip install yfinance --break-system-packages")
 
 
+def _chunked(seq, size):
+    """Split seq into consecutive chunks of at most `size` items."""
+    seq = list(seq)
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _yahoo_symbol(sym):
+    """Translate an IB-style symbol to the equivalent Yahoo Finance symbol.
+
+    IB (and this codebase's watch.txt) writes preferred/class shares with a
+    slash, e.g. 'AGM/PG', 'BF/B'. Yahoo Finance expects a hyphen instead,
+    e.g. 'AGM-PG', 'BF-B'. Sending the '/' form to Yahoo doesn't just miss
+    data — Yahoo's endpoint returns an HTML/empty body for these, which
+    surfaces as a confusing 'Expecting value: line 1 column 1 (char 0)'
+    JSON-decode error, and the ticker then gets misreported as "possibly
+    delisted" even though it trades fine. This affects nothing on the IB
+    side; it's purely a Yahoo-request-time translation.
+    """
+    return sym.replace("/", "-")
+
+
+def _yf_batch_download(symbols, period, interval, prepost, dt_fmt):
+    """Shared chunked/non-threaded yfinance batch downloader.
+
+    yfinance's download() spawns roughly one OS thread per ticker when its
+    default threads=True is used. Calling it with an entire multi-thousand
+    symbol watchlist in one shot exhausts the OS thread limit partway
+    through and raises 'RuntimeError: can't start new thread' — every
+    ticker after that point then fails too, which is what happened here.
+    Splitting into small chunks and passing threads=False keeps the OS
+    thread count bounded no matter how large the watchlist is.
+    """
+    result = {sym: {} for sym in symbols}
+    if not symbols:
+        return result
+
+    for chunk in _chunked(symbols, YF_BATCH_CHUNK_SIZE):
+        yahoo_map = {_yahoo_symbol(s): s for s in chunk}   # yahoo_sym -> orig_sym
+        yahoo_tix = list(yahoo_map.keys())
+        try:
+            kwargs = dict(tickers=yahoo_tix, period=period, interval=interval,
+                          group_by="ticker", auto_adjust=True, progress=False,
+                          threads=False)
+            if prepost is not None:
+                kwargs["prepost"] = prepost
+            df = _yf().download(**kwargs)
+        except Exception as e:
+            print(f"  [yf] batch chunk failed ({len(chunk)} symbols, "
+                  f"interval={interval}): {e}")
+            continue
+
+        parsed = _parse_yf(df, yahoo_tix, dt_fmt)
+        for yahoo_sym, bars in parsed.items():
+            orig_sym = yahoo_map.get(yahoo_sym, yahoo_sym)
+            result[orig_sym] = bars
+
+        time.sleep(YF_CHUNK_SLEEP)
+
+    return result
+
+
 def yf_fetch_minute_batch(symbols):
-    """Fetch today's 1-min bars for all symbols in one call (includes pre/post market)."""
+    """Fetch today's 1-min bars for all symbols in one (chunked) pass (includes pre/post market)."""
     if not symbols: return {}
-    df = _yf().download(tickers=symbols, period="1d", interval="1m",
-                        prepost=True, group_by="ticker", auto_adjust=True, progress=False)
-    return _parse_yf(df, symbols, "%Y%m%d%H%M")
+    return _yf_batch_download(symbols, period="1d", interval="1m",
+                               prepost=True, dt_fmt="%Y%m%d%H%M")
 
 
 def yf_fetch_minute_window(symbols, days):
     """Fetch last N days of 1-min bars for a list of symbols (includes pre/post market)."""
     if not symbols: return {}
     days = min(days, YF_MAX_MINUTE_DAYS)
-    df   = _yf().download(tickers=symbols, period=f"{days}d", interval="1m",
-                          prepost=True, group_by="ticker", auto_adjust=True, progress=False)
-    return _parse_yf(df, symbols, "%Y%m%d%H%M")
+    return _yf_batch_download(symbols, period=f"{days}d", interval="1m",
+                               prepost=True, dt_fmt="%Y%m%d%H%M")
 
 
 def yf_fetch_daily_batch(symbols, period="5d"):
-    """Fetch recent daily bars for all symbols in one call."""
+    """Fetch recent daily bars for all symbols in one (chunked) pass."""
     if not symbols: return {}
-    df = _yf().download(tickers=symbols, period=period, interval="1d",
-                        group_by="ticker", auto_adjust=True, progress=False)
-    return _parse_yf(df, symbols, "%Y%m%d")
+    return _yf_batch_download(symbols, period=period, interval="1d",
+                               prepost=None, dt_fmt="%Y%m%d")
 
 
 def _parse_yf(df, symbols, dt_fmt):
@@ -582,7 +709,17 @@ def compute_minute_gaps(symbol, recent_days):
 # ── Historical backfill ───────────────────────────────────────────────────────
 
 def backfill_symbols(symbols, today_str, recent_days, start_date=None, force_refresh=False):
-    """Gap-fill daily + minute data for all symbols using IB."""
+    """Gap-fill daily + minute data for all symbols using IB.
+
+    IMPORTANT: every symbol's rows are saved to disk (save_daily/save_minute)
+    the moment its own fetch pass completes — either right after the
+    yfinance-only path resolves it, or right after its IB fetch in the loop
+    below. Data is NOT accumulated in memory and saved in one big batch at
+    the end: with thousands of symbols needing IB, a single connection drop
+    partway through (IB error 1100) previously meant the entire run could
+    sit for hours with nothing on disk at all, since the old code's save
+    loop only ran after every symbol had been attempted.
+    """
     now_utc    = datetime.now(timezone.utc)
     end_dt     = datetime.strptime(today_str, "%Y%m%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
     cal_start  = last_n_trading_days(MIN_DAILY_BARS + 1)[0]
@@ -613,7 +750,9 @@ def backfill_symbols(symbols, today_str, recent_days, start_date=None, force_ref
           f"{total_d} daily day(s) to fill, {total_m} minute day(s) to fill")
 
     # Step A: yfinance batch — fills recent daily + minute gaps instantly
-    # This covers last 5-7 days for all symbols in one HTTP call each.
+    # This covers last 5-7 days for all symbols (chunked into batches of
+    # YF_BATCH_CHUNK_SIZE to avoid the OS-thread exhaustion / mass-failure
+    # seen when the whole watchlist was sent to yf.download() in one call).
     # NOTE: yfinance's daily "7d" window only has ~5 *trading* days in it, so
     # this step can only ever close a handful of the gaps for a first-run/deep
     # backfill (where miss_daily has ~500 entries) — the vast majority of a
@@ -621,7 +760,8 @@ def backfill_symbols(symbols, today_str, recent_days, start_date=None, force_ref
     # not a bug: yfinance here is just a fast top-up for the last few days so
     # IB has less to do, not a substitute for deep history.
     all_syms = [s for s, _ in needs_ib]
-    print(f"[backfill] step 1/2: yfinance batch for recent bars ...")
+    print(f"[backfill] step 1/2: yfinance batch for recent bars "
+          f"({len(all_syms)} symbols, chunks of {YF_BATCH_CHUNK_SIZE}) ...")
     yf_daily  = yf_fetch_daily_batch(all_syms, period="7d")
     yf_minute = yf_fetch_minute_window(all_syms, MINUTE_DAYS + 2)
 
@@ -655,6 +795,17 @@ def backfill_symbols(symbols, today_str, recent_days, start_date=None, force_ref
               f"from yfinance -> filled {filled_d} daily gap(s), {filled_m} minute-day gap(s) "
               f"| {len(gap['miss_daily'])} daily, {len(gap['miss_minute'])} minute-day(s) still missing")
 
+    # Symbols yfinance fully resolved never enter the IB loop below, so save
+    # them now rather than waiting on IB symbols that may take hours.
+    yf_only = [(s, g) for s, g in needs_ib if not (g["miss_daily"] or g["miss_minute"])]
+    for sym, gap in yf_only:
+        save_daily(sym, gap["daily_rows"])
+        save_minute(sym, gap["minute_rows"])
+        if gap["daily_rows"]:
+            run_daily_ma(sym, sorted(gap["daily_rows"])[0])
+    if yf_only:
+        print(f"[backfill] saved {len(yf_only)} symbol(s) fully resolved by yfinance alone")
+
     # Step B: IB — only for deep historical gaps yfinance can't cover
     still_needs_ib = [(s, g) for s, g in needs_ib if g["miss_daily"] or g["miss_minute"]]
     if still_needs_ib:
@@ -664,7 +815,14 @@ def backfill_symbols(symbols, today_str, recent_days, start_date=None, force_ref
               f"{total_d2} daily, {total_m2} minute day(s) remaining")
         with _IB_SESSION_LOCK:
             with IBSession() as app:
-                for sym, gap in still_needs_ib:
+                for idx, (sym, gap) in enumerate(still_needs_ib):
+                    if app._connection_lost.is_set():
+                        remaining = len(still_needs_ib) - idx
+                        print(f"  [ib] connection lost — skipping remaining "
+                              f"{remaining} symbol(s) this pass; they stay "
+                              f"flagged as gaps and will be retried on the next run")
+                        break
+
                     contract = make_contract(sym)
                     if gap["miss_daily"]:
                         lo = datetime.strptime(min(gap["miss_daily"]), "%Y%m%d").replace(tzinfo=timezone.utc)
@@ -672,29 +830,29 @@ def backfill_symbols(symbols, today_str, recent_days, start_date=None, force_ref
                         filtered = {k: v for k, v in fetched.items() if k in set(gap["miss_daily"])}
                         gap["daily_rows"].update(filtered)
                         print(f"  [ib] {sym}: +{len(filtered)} daily bars")
-                    if gap["miss_minute"]:
-                        lo = datetime.strptime(min(gap["miss_minute"]), "%Y%m%d").replace(tzinfo=timezone.utc)
+                    if gap["miss_minute"] and not app._connection_lost.is_set():
                         # IB is requested for the *whole* day range covering every
                         # flagged day (not just fully-missing ones), so a day that
                         # was flagged for an intraday hole gets its missing minutes
                         # merged in here via dict update — bars already on disk for
                         # that day are simply overwritten with the same IB values,
                         # and the previously-missing timestamps get filled in.
+                        lo = datetime.strptime(min(gap["miss_minute"]), "%Y%m%d").replace(tzinfo=timezone.utc)
                         fetched = {k: v for k, v in ib_fetch_minute(app, contract, lo, end_dt).items()
                                    if k[:8] in set(gap["miss_minute"])}
                         gap["minute_rows"].update(fetched)
                         print(f"  [ib] {sym}: +{len(fetched)} minute bars")
+
+                    # Save THIS symbol immediately — don't wait for the rest
+                    # of a potentially thousands-symbol IB pass to finish.
+                    save_daily(sym, gap["daily_rows"])
+                    save_minute(sym, gap["minute_rows"])
+                    if gap["daily_rows"]:
+                        run_daily_ma(sym, sorted(gap["daily_rows"])[0])
+                    print(f"  [saved] {sym}: {len(gap['daily_rows'])} daily, "
+                          f"{len(gap['minute_rows'])} minute bars")
     else:
         print("[backfill] step 2/2: no IB fetch needed — yfinance covered all gaps")
-
-    # Save and compute MAs
-    for sym, gap in sym_gaps.items():
-        save_daily(sym, gap["daily_rows"])
-        save_minute(sym, gap["minute_rows"])
-        if gap["daily_rows"]:
-            run_daily_ma(sym, sorted(gap["daily_rows"])[0])
-        print(f"  [saved] {sym}: {len(gap['daily_rows'])} daily, "
-              f"{len(gap['minute_rows'])} minute bars")
 
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
@@ -907,6 +1065,10 @@ def post_close_reconcile(symbols, minute_cache):
         with _IB_SESSION_LOCK:
             with IBSession() as app:
                 for sym, days in still_gappy.items():
+                    if app._connection_lost.is_set():
+                        print(f"  [ib] connection lost — skipping remaining minute "
+                              f"gap backfill this pass; will retry next run")
+                        break
                     contract = make_contract(sym)
                     lo = datetime.strptime(min(days), "%Y%m%d").replace(tzinfo=timezone.utc)
                     fetched = {k: v for k, v in ib_fetch_minute(app, contract, lo, end_dt).items()

@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Buy Low / Sell High — Backtest Terminal</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#0b0f14;
+    --panel:#121821;
+    --panel-2:#0e141c;
+    --border:#20293380;
+    --border-strong:#2a3542;
+    --text:#dfe6ec;
+    --muted:#6f7d8c;
+    --amber:#e8a33d;
+    --amber-dim:#e8a33d33;
+    --green:#3fb96f;
+    --green-dim:#3fb96f22;
+    --red:#e5534b;
+    --red-dim:#e5534b22;
+    --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: 'IBM Plex Sans', -apple-system, sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:
+      radial-gradient(1200px 600px at 15% -10%, #17202c 0%, transparent 60%),
+      var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    min-height:100vh;
+    padding:28px;
+  }
+  ::selection{background:var(--amber-dim); color:var(--amber);}
+
+  .wrap{max-width:1180px; margin:0 auto;}
+
+  /* ── Header ───────────────────────────────────────────── */
+  header{
+    display:flex; align-items:flex-end; justify-content:space-between;
+    border-bottom:1px solid var(--border-strong);
+    padding-bottom:18px; margin-bottom:22px; flex-wrap:wrap; gap:14px;
+  }
+  .brand{display:flex; align-items:baseline; gap:12px;}
+  .brand .mark{
+    font-family:var(--mono); font-weight:700; font-size:13px; letter-spacing:.12em;
+    color:var(--amber); border:1px solid var(--amber-dim); padding:3px 7px; border-radius:3px;
+  }
+  h1{
+    font-family:var(--mono); font-size:19px; font-weight:600; margin:0;
+    letter-spacing:.01em;
+  }
+  h1 .lo{color:var(--green);} h1 .hi{color:var(--red);}
+  .meta{font-family:var(--mono); font-size:11.5px; color:var(--muted); text-align:right; line-height:1.7;}
+  .meta b{color:var(--text); font-weight:600;}
+
+  /* ── Controls ─────────────────────────────────────────── */
+  .controls{display:flex; align-items:center; gap:10px; margin-bottom:20px; flex-wrap:wrap;}
+  .seg{display:flex; border:1px solid var(--border-strong); border-radius:6px; overflow:hidden;}
+  .seg button{
+    font-family:var(--mono); font-size:12px; background:var(--panel-2); color:var(--muted);
+    border:none; padding:8px 14px; cursor:pointer; transition:.15s;
+  }
+  .seg button + button{border-left:1px solid var(--border-strong);}
+  .seg button.active{background:var(--amber-dim); color:var(--amber);}
+  .seg button:hover:not(.active){color:var(--text);}
+  select{
+    font-family:var(--mono); font-size:12px; background:var(--panel-2); color:var(--text);
+    border:1px solid var(--border-strong); border-radius:6px; padding:8px 12px; cursor:pointer;
+  }
+  .status{font-family:var(--mono); font-size:11px; color:var(--muted); margin-left:auto;}
+  .status.live::before{content:"●"; color:var(--green); margin-right:5px;}
+  .status.demo::before{content:"●"; color:var(--amber); margin-right:5px;}
+
+  /* ── Panels ───────────────────────────────────────────── */
+  .panel{
+    background:var(--panel); border:1px solid var(--border-strong); border-radius:10px;
+    padding:18px 20px; margin-bottom:18px;
+  }
+  .panel-title{
+    font-family:var(--mono); font-size:11px; letter-spacing:.1em; color:var(--muted);
+    text-transform:uppercase; margin:0 0 14px 0; display:flex; justify-content:space-between; align-items:center;
+  }
+
+  /* ── Stat grid ────────────────────────────────────────── */
+  .stats{display:grid; grid-template-columns:repeat(4, 1fr); gap:1px; background:var(--border-strong);
+    border:1px solid var(--border-strong); border-radius:10px; overflow:hidden; margin-bottom:18px;}
+  .stat{background:var(--panel); padding:16px 18px;}
+  .stat .label{font-family:var(--mono); font-size:10px; letter-spacing:.08em; color:var(--muted); text-transform:uppercase;}
+  .stat .value{font-family:var(--mono); font-size:22px; font-weight:600; margin-top:6px;}
+  .stat .value.pos{color:var(--green);}
+  .stat .value.neg{color:var(--red);}
+  .stat .sub{font-family:var(--mono); font-size:10.5px; color:var(--muted); margin-top:3px;}
+  @media (max-width:760px){ .stats{grid-template-columns:repeat(2,1fr);} }
+
+  canvas{width:100%;}
+
+  /* ── Trade tape ───────────────────────────────────────── */
+  table{width:100%; border-collapse:collapse; font-family:var(--mono); font-size:12px;}
+  thead th{
+    text-align:left; font-weight:500; color:var(--muted); font-size:10px; letter-spacing:.08em;
+    text-transform:uppercase; padding:8px 10px; border-bottom:1px solid var(--border-strong);
+  }
+  tbody td{padding:8px 10px; border-bottom:1px solid var(--border);}
+  tbody tr:hover{background:var(--panel-2);}
+  .pnl-pos{color:var(--green);} .pnl-neg{color:var(--red);}
+  .reason{font-size:10.5px; padding:2px 7px; border-radius:3px; display:inline-block;}
+  .reason.take_profit{background:var(--green-dim); color:var(--green);}
+  .reason.stop_loss{background:var(--red-dim); color:var(--red);}
+  .reason.time_stop{background:var(--amber-dim); color:var(--amber);}
+
+  .empty{font-family:var(--mono); font-size:12px; color:var(--muted); padding:30px 0; text-align:center;}
+
+  .footnote{font-family:var(--mono); font-size:10.5px; color:var(--muted); line-height:1.7; margin-top:6px;}
+  .footnote code{color:var(--amber);}
+  .legend-note{font-weight:400; text-transform:none; letter-spacing:0; font-size:10.5px;}
+
+  /* ── Diagnostics ──────────────────────────────────────── */
+  .diag-bars{display:flex; flex-direction:column; gap:10px;}
+  .diag-row{display:grid; grid-template-columns:170px 1fr 60px; align-items:center; gap:12px;}
+  .diag-row .dlabel{font-family:var(--mono); font-size:11.5px; color:var(--muted);}
+  .diag-track{height:8px; background:var(--panel-2); border:1px solid var(--border); border-radius:4px; overflow:hidden;}
+  .diag-fill{height:100%; background:var(--amber);}
+  .diag-fill.tight{background:var(--red);}
+  .diag-count{font-family:var(--mono); font-size:11.5px; color:var(--text); text-align:right;}
+  .diag-verdict{font-family:var(--mono); font-size:11.5px; color:var(--amber); margin-top:12px; padding-top:12px; border-top:1px solid var(--border);}
+
+  /* ── Range banner ─────────────────────────────────────── */
+  .range-banner{
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    font-family:var(--mono); font-size:12px; color:var(--text);
+    background:var(--panel-2); border:1px solid var(--border-strong); border-radius:8px;
+    padding:10px 16px; margin-bottom:18px;
+  }
+  .range-banner .tag{
+    font-size:10px; letter-spacing:.08em; color:var(--muted); text-transform:uppercase;
+  }
+  .range-banner .val{color:var(--amber);}
+  .range-banner .sep{color:var(--border-strong);}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand">
+      <span class="mark">BT</span>
+      <h1><span class="lo">buy low</span> / <span class="hi">sell high</span> — backtest terminal</h1>
+    </div>
+    <div class="meta" id="headerMeta">loading…</div>
+  </header>
+
+  <div class="controls">
+    <div class="seg" id="tfToggle"></div>
+    <select id="symbolSelect"></select>
+    <span class="status" id="dataStatus">connecting…</span>
+  </div>
+
+  <div class="range-banner" id="rangeBanner"></div>
+
+  <div class="stats" id="statGrid"></div>
+
+  <div class="panel">
+    <p class="panel-title">
+      <span>Price &amp; signals</span>
+      <span class="legend-note">close · Bollinger bands · trend SMA · ▲ buy ▼ sell</span>
+    </p>
+    <canvas id="priceChart" height="110"></canvas>
+  </div>
+
+  <div class="panel" id="diagPanel"></div>
+
+  <div class="panel">
+    <p class="panel-title">
+      <span>Equity curve</span>
+      <span id="equityRange" style="font-weight:400; text-transform:none; letter-spacing:0;"></span>
+    </p>
+    <canvas id="equityChart" height="90"></canvas>
+  </div>
+
+  <div class="panel">
+    <p class="panel-title">All runs — total return</p>
+    <canvas id="compareChart" height="70"></canvas>
+  </div>
+
+  <div class="panel">
+    <p class="panel-title">
+      <span>Trade log</span>
+      <span id="tradeCount" style="font-weight:400; text-transform:none; letter-spacing:0;"></span>
+    </p>
+    <div id="tradeTableWrap"></div>
+  </div>
+
+  <p class="footnote" id="footnote"></p>
+
+</div>
+
+<script>
+/* ────────────────────────────────────────────────────────────────────────
+   Data loading. In the real project this fetches results/summary.json,
+   written by `python3 backtest.py`. If that file isn't reachable (e.g.
+   this page is being previewed on its own, or the backtest hasn't been
+   run yet), a small embedded demo dataset takes over so the dashboard
+   still renders — a banner makes it clear which mode you're in.
+   ──────────────────────────────────────────────────────────────────────── */
+
+const DEMO_DATA = (() => {
+  function genEquity(n, seed, drift, vol) {
+    let e = 10000, rows = [], t = new Date('2025-01-02T09:30:00');
+    let s = seed;
+    const rnd = () => { s = (s * 1103515245 + 12345) % 2147483648; return s / 2147483648; };
+    for (let i = 0; i < n; i++) {
+      e *= 1 + drift + (rnd() - 0.5) * vol;
+      rows.push({ t: new Date(t.getTime() + i * 86400000).toISOString(), e: Math.round(e * 100) / 100 });
+    }
+    return rows;
+  }
+  function genTrades(n, seed) {
+    let s = seed, rows = [], t = new Date('2025-02-01');
+    const rnd = () => { s = (s * 1103515245 + 12345) % 2147483648; return s / 2147483648; };
+    const reasons = ['take_profit', 'take_profit', 'stop_loss', 'time_stop'];
+    for (let i = 0; i < n; i++) {
+      const entry = 100 + rnd() * 40;
+      const pnl = (rnd() - 0.42) * 6;
+      t = new Date(t.getTime() + (2 + rnd() * 5) * 86400000);
+      const exitT = new Date(t.getTime() + (1 + rnd() * 4) * 86400000);
+      rows.push({
+        entry_date: t.toISOString(), entry_price: Math.round(entry * 100) / 100,
+        exit_date: exitT.toISOString(), exit_price: Math.round(entry * (1 + pnl / 100) * 100) / 100,
+        pnl_pct: Math.round(pnl * 1000) / 1000,
+        bars_held: 2 + Math.floor(rnd() * 15),
+        exit_reason: reasons[Math.floor(rnd() * reasons.length)],
+      });
+    }
+    return rows;
+  }
+  function metricsFrom(equity, trades, capital) {
+    const final = equity[equity.length - 1].e;
+    const wins = trades.filter(t => t.pnl_pct > 0);
+    const losses = trades.filter(t => t.pnl_pct <= 0);
+    let peak = -Infinity, maxDd = 0;
+    equity.forEach(r => { peak = Math.max(peak, r.e); maxDd = Math.min(maxDd, (r.e - peak) / peak); });
+    return {
+      final_equity: final,
+      total_return_pct: Math.round((final / capital - 1) * 1000) / 10,
+      cagr_pct: Math.round((final / capital - 1) * 900) / 10,
+      max_drawdown_pct: Math.round(maxDd * 1000) / 10,
+      sharpe: Math.round((Math.random() * 1.4 - 0.2) * 100) / 100,
+      num_trades: trades.length,
+      win_rate_pct: Math.round(wins.length / trades.length * 1000) / 10,
+      avg_win_pct: Math.round((wins.reduce((a, t) => a + t.pnl_pct, 0) / (wins.length || 1)) * 100) / 100,
+      avg_loss_pct: Math.round((losses.reduce((a, t) => a + t.pnl_pct, 0) / (losses.length || 1)) * 100) / 100,
+      profit_factor: 1.1,
+    };
+  }
+  const capital = 10000;
+  const runsCfg = [
+    ['AAPL', 'daily', 1, 0.0006, 0.018, 42],
+    ['AAPL', 'minute', 2, 0.0002, 0.006, 30],
+    ['MSFT', 'daily', 3, 0.0004, 0.02, 38],
+    ['GOOGL', 'daily', 4, -0.0002, 0.022, 20],
+  ];
+  function genPriceCurve(equity, seed) {
+    let s = seed;
+    const rnd = () => { s = (s * 1103515245 + 12345) % 2147483648; return s / 2147483648; };
+    let price = 100;
+    return equity.map(r => {
+      price *= 1 + (rnd() - 0.5) * 0.01;
+      const sma = price * (1 - 0.01 - rnd() * 0.02);
+      const spread = price * (0.02 + rnd() * 0.02);
+      return { t: r.t, c: Math.round(price * 100) / 100, bu: Math.round((price + spread) * 100) / 100,
+               bl: Math.round((price - spread) * 100) / 100, sma: Math.round(sma * 100) / 100 };
+    });
+  }
+
+  const runs = runsCfg.map(([sym, tf, seed, drift, vol, n]) => {
+    const equity = genEquity(220, seed * 7919, drift, vol);
+    const trades = genTrades(n, seed * 104729);
+    const price_curve = genPriceCurve(equity, seed * 5381);
+    const warmed = price_curve.length;
+    return {
+      symbol: sym, timeframe: tf,
+      metrics: metricsFrom(equity, trades, capital),
+      diagnostics: {
+        bars_total: warmed + 50, bars_warmed_up: warmed,
+        bb_touch_bars: Math.round(warmed * 0.06), rsi_oversold_bars: Math.round(warmed * 0.09),
+        above_trend_bars: Math.round(warmed * 0.5), all_conditions_bars: n,
+        all_conditions_bars_windowed: n, signal_window: 0,
+      },
+      equity_curve: equity, price_curve, trades, trades_capped: false, bars_used: warmed,
+      start: equity[0].t, end: equity[equity.length - 1].t,
+    };
+  });
+  return { generated_at: new Date().toISOString(), capital, runs, demo: true,
+            params: { signal_window: 0, start: null, end: null } };
+})();
+
+let STATE = { data: null, timeframe: 'daily', symbol: null, isDemo: false };
+let equityChart = null, compareChart = null, priceChart = null;
+
+async function loadData() {
+  try {
+    const res = await fetch('results/summary.json', { cache: 'no-store' });
+    if (!res.ok) throw new Error('not found');
+    const data = await res.json();
+    if (!data.runs || !data.runs.length) throw new Error('empty');
+    STATE.data = data; STATE.isDemo = false;
+  } catch (e) {
+    STATE.data = DEMO_DATA; STATE.isDemo = true;
+  }
+  init();
+}
+
+function fmtPct(v) {
+  const sign = v > 0 ? '+' : '';
+  return `${sign}${v.toFixed(2)}%`;
+}
+function fmtMoney(v) {
+  return '$' + v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+}
+function fmtDate(iso) {
+  const d = new Date(iso);
+  return d.toISOString().slice(0, 16).replace('T', ' ');
+}
+
+function availableTimeframes() {
+  return [...new Set(STATE.data.runs.map(r => r.timeframe))];
+}
+function symbolsForTimeframe(tf) {
+  return STATE.data.runs.filter(r => r.timeframe === tf).map(r => r.symbol);
+}
+function currentRun() {
+  return STATE.data.runs.find(r => r.timeframe === STATE.timeframe && r.symbol === STATE.symbol);
+}
+
+function renderHeader() {
+  const d = STATE.data;
+  document.getElementById('headerMeta').innerHTML =
+    `generated <b>${fmtDate(d.generated_at)}</b> &nbsp;·&nbsp; capital/run <b>${fmtMoney(d.capital)}</b>`;
+  const status = document.getElementById('dataStatus');
+  if (STATE.isDemo) {
+    status.textContent = 'demo data — run backtest.py to see your results';
+    status.className = 'status demo';
+  } else {
+    status.textContent = 'live — results/summary.json';
+    status.className = 'status live';
+  }
+}
+
+function renderControls() {
+  const tfs = availableTimeframes();
+  const tfWrap = document.getElementById('tfToggle');
+  tfWrap.innerHTML = '';
+  tfs.forEach(tf => {
+    const btn = document.createElement('button');
+    btn.textContent = tf.toUpperCase();
+    btn.className = tf === STATE.timeframe ? 'active' : '';
+    btn.onclick = () => {
+      STATE.timeframe = tf;
+      const syms = symbolsForTimeframe(tf);
+      if (!syms.includes(STATE.symbol)) STATE.symbol = syms[0];
+      renderAll();
+    };
+    tfWrap.appendChild(btn);
+  });
+
+  const symSel = document.getElementById('symbolSelect');
+  symSel.innerHTML = '';
+  symbolsForTimeframe(STATE.timeframe).forEach(sym => {
+    const opt = document.createElement('option');
+    opt.value = sym; opt.textContent = sym;
+    if (sym === STATE.symbol) opt.selected = true;
+    symSel.appendChild(opt);
+  });
+  symSel.onchange = () => { STATE.symbol = symSel.value; renderAll(); };
+}
+
+function renderRangeBanner() {
+  const run = currentRun();
+  const banner = document.getElementById('rangeBanner');
+  if (!run) { banner.innerHTML = ''; return; }
+  const p = STATE.data.params || {};
+  const rangeSource = (p.start || p.end) ? 'custom --start/--end' : 'full available history';
+  banner.innerHTML = `
+    <span class="tag">Simulated</span><span class="val">${fmtDate(run.start)} → ${fmtDate(run.end)}</span>
+    <span class="sep">|</span>
+    <span class="tag">Bars</span><span class="val">${run.bars_used.toLocaleString()}</span>
+    <span class="sep">|</span>
+    <span class="tag">Range source</span><span class="val">${rangeSource}</span>
+    ${p.signal_window ? `<span class="sep">|</span><span class="tag">Signal window</span><span class="val">${p.signal_window} bars</span>` : ''}
+  `;
+}
+
+function renderStats() {
+  const run = currentRun();
+  const grid = document.getElementById('statGrid');
+  if (!run) { grid.innerHTML = ''; return; }
+  const m = run.metrics;
+  const cells = [
+    ['Total return', fmtPct(m.total_return_pct), m.total_return_pct >= 0 ? 'pos' : 'neg', `${fmtMoney(run.metrics.final_equity)} final`],
+    ['CAGR', fmtPct(m.cagr_pct), m.cagr_pct >= 0 ? 'pos' : 'neg', ''],
+    ['Max drawdown', fmtPct(m.max_drawdown_pct), 'neg', ''],
+    ['Sharpe', m.sharpe.toFixed(2), m.sharpe >= 0 ? 'pos' : 'neg', ''],
+    ['Trades', m.num_trades, '', ''],
+    ['Win rate', `${m.win_rate_pct.toFixed(0)}%`, '', `${fmtPct(m.avg_win_pct)} avg win`],
+    ['Avg loss', fmtPct(m.avg_loss_pct), 'neg', ''],
+    ['Profit factor', m.profit_factor == null ? '∞' : m.profit_factor.toFixed(2), '', ''],
+  ];
+  grid.innerHTML = cells.map(([label, val, cls, sub]) => `
+    <div class="stat">
+      <div class="label">${label}</div>
+      <div class="value ${cls}">${val}</div>
+      ${sub ? `<div class="sub">${sub}</div>` : ''}
+    </div>
+  `).join('');
+}
+
+function renderEquityChart() {
+  const run = currentRun();
+  const ctx = document.getElementById('equityChart');
+  const rangeEl = document.getElementById('equityRange');
+  if (!run) { if (equityChart) equityChart.destroy(); return; }
+
+  rangeEl.textContent = `${fmtDate(run.start)}  →  ${fmtDate(run.end)}`;
+  const labels = run.equity_curve.map(p => p.t);
+  const values = run.equity_curve.map(p => p.e);
+  const up = values[values.length - 1] >= values[0];
+
+  if (equityChart) equityChart.destroy();
+  equityChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        data: values,
+        borderColor: up ? '#3fb96f' : '#e5534b',
+        backgroundColor: up ? '#3fb96f18' : '#e5534b18',
+        borderWidth: 1.6,
+        pointRadius: 0,
+        fill: true,
+        tension: 0.15,
+      }],
+    },
+    options: {
+      responsive: true,
+      animation: false,
+      plugins: { legend: { display: false }, tooltip: {
+        backgroundColor: '#0e141c', borderColor: '#2a3542', borderWidth: 1,
+        titleFont: { family: 'JetBrains Mono', size: 11 }, bodyFont: { family: 'JetBrains Mono', size: 11 },
+        callbacks: { label: (c) => fmtMoney(c.parsed.y) }
+      }},
+      scales: {
+        x: { display: false },
+        y: {
+          grid: { color: '#20293350' },
+          ticks: { color: '#6f7d8c', font: { family: 'JetBrains Mono', size: 10 }, callback: v => fmtMoney(v) },
+        },
+      },
+    },
+  });
+}
+
+function nearestLabelIndex(times, targetIso) {
+  // times: array of millis, sorted ascending. Snaps a trade's timestamp to
+  // the closest point actually present in the (possibly downsampled) price
+  // series, so markers line up with a real plotted point.
+  const target = new Date(targetIso).getTime();
+  let lo = 0, hi = times.length - 1;
+  if (target <= times[0]) return 0;
+  if (target >= times[hi]) return hi;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (times[mid] < target) lo = mid + 1; else hi = mid;
+  }
+  const before = lo > 0 ? lo - 1 : lo;
+  return Math.abs(times[before] - target) <= Math.abs(times[lo] - target) ? before : lo;
+}
+
+function renderPriceChart() {
+  const run = currentRun();
+  const ctx = document.getElementById('priceChart');
+  if (!run || !run.price_curve || !run.price_curve.length) {
+    if (priceChart) priceChart.destroy();
+    return;
+  }
+  const pc = run.price_curve;
+  const labels = pc.map(p => p.t);
+  const times = pc.map(p => new Date(p.t).getTime());
+
+  const buyArr = new Array(pc.length).fill(null);
+  const sellArr = new Array(pc.length).fill(null);
+  run.trades.forEach(t => {
+    buyArr[nearestLabelIndex(times, t.entry_date)] = t.entry_price;
+    sellArr[nearestLabelIndex(times, t.exit_date)] = t.exit_price;
+  });
+
+  if (priceChart) priceChart.destroy();
+  priceChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Close', data: pc.map(p => p.c), borderColor: '#dfe6ec', borderWidth: 1.3, pointRadius: 0, tension: 0.1 },
+        { label: 'BB upper', data: pc.map(p => p.bu), borderColor: '#e8a33d66', borderWidth: 1, pointRadius: 0, borderDash: [3, 3], tension: 0.1 },
+        { label: 'BB lower', data: pc.map(p => p.bl), borderColor: '#e8a33d66', borderWidth: 1, pointRadius: 0, borderDash: [3, 3], tension: 0.1 },
+        { label: 'Trend SMA', data: pc.map(p => p.sma), borderColor: '#6f7d8c', borderWidth: 1, pointRadius: 0, tension: 0.1 },
+        { label: 'Buy', data: buyArr, showLine: false, pointStyle: 'triangle', pointRadius: 6, pointBackgroundColor: '#3fb96f', pointBorderColor: '#3fb96f', rotation: 0 },
+        { label: 'Sell', data: sellArr, showLine: false, pointStyle: 'triangle', pointRadius: 6, pointBackgroundColor: '#e5534b', pointBorderColor: '#e5534b', rotation: 180 },
+      ],
+    },
+    options: {
+      responsive: true,
+      animation: false,
+      interaction: { mode: 'nearest', intersect: false },
+      plugins: {
+        legend: { display: true, labels: { color: '#6f7d8c', font: { family: 'JetBrains Mono', size: 10 }, boxWidth: 10, filter: (item) => item.text !== 'Buy' && item.text !== 'Sell' } },
+        tooltip: {
+          backgroundColor: '#0e141c', borderColor: '#2a3542', borderWidth: 1,
+          titleFont: { family: 'JetBrains Mono', size: 11 }, bodyFont: { family: 'JetBrains Mono', size: 11 },
+          filter: (item) => item.parsed.y !== null,
+        },
+      },
+      scales: {
+        x: { display: false },
+        y: { grid: { color: '#20293350' }, ticks: { color: '#6f7d8c', font: { family: 'JetBrains Mono', size: 10 } } },
+      },
+    },
+  });
+}
+
+function renderDiagnostics() {
+  const run = currentRun();
+  const panel = document.getElementById('diagPanel');
+  if (!run || !run.diagnostics) { panel.innerHTML = ''; return; }
+  const d = run.diagnostics;
+  const total = d.bars_warmed_up || 1;
+  const rows = [
+    ['Touches lower Bollinger Band', d.bb_touch_bars],
+    ['RSI oversold', d.rsi_oversold_bars],
+    ['Close above trend SMA', d.above_trend_bars],
+    ['All three, same bar', d.all_conditions_bars],
+  ];
+  if (d.signal_window > 0) rows.push([`All three within ${d.signal_window}-bar window`, d.all_conditions_bars_windowed]);
+  const tightest = rows.slice(0, 3).reduce((a, b) => (a[1] <= b[1] ? a : b));
+  const zeroVerdict = d.signal_window > 0
+    ? `0 trades — tightest constraint is "${tightest[0]}" (${tightest[1]} bars), and the ${d.signal_window}-bar tolerance still only found ${d.all_conditions_bars_windowed}. Loosen --rsi-buy or the band width if you expected activity here.`
+    : `0 trades — tightest constraint is "${tightest[0]}" (${tightest[1]} bars). Try re-running with --signal-window 3 (or higher), which lets the dip and the trend check land on different bars instead of requiring the exact same one.`;
+  panel.innerHTML = `
+    <p class="panel-title">Entry-condition diagnostics <span class="legend-note">${d.bars_warmed_up} usable bars of ${d.bars_total} total</span></p>
+    <div class="diag-bars">
+      ${rows.map(([label, n]) => {
+        const pct = Math.min(100, (n / total) * 100);
+        const isBottleneck = label === tightest[0];
+        return `
+        <div class="diag-row">
+          <div class="dlabel">${label}</div>
+          <div class="diag-track"><div class="diag-fill ${isBottleneck ? 'tight' : ''}" style="width:${pct}%"></div></div>
+          <div class="diag-count">${n}</div>
+        </div>`;
+      }).join('')}
+    </div>
+    ${run.metrics.num_trades === 0 ? `<div class="diag-verdict">${zeroVerdict}</div>` : ''}
+  `;
+}
+
+function renderCompareChart() {
+  const runs = STATE.data.runs;
+  const ctx = document.getElementById('compareChart');
+  const labels = runs.map(r => `${r.symbol} · ${r.timeframe}`);
+  const values = runs.map(r => r.metrics.total_return_pct);
+
+  if (compareChart) compareChart.destroy();
+  compareChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        data: values,
+        backgroundColor: values.map(v => v >= 0 ? '#3fb96f' : '#e5534b'),
+        borderRadius: 3,
+        maxBarThickness: 34,
+      }],
+    },
+    options: {
+      responsive: true,
+      animation: false,
+      plugins: { legend: { display: false }, tooltip: {
+        backgroundColor: '#0e141c', borderColor: '#2a3542', borderWidth: 1,
+        titleFont: { family: 'JetBrains Mono', size: 11 }, bodyFont: { family: 'JetBrains Mono', size: 11 },
+        callbacks: { label: (c) => fmtPct(c.parsed.y) }
+      }},
+      scales: {
+        x: { ticks: { color: '#6f7d8c', font: { family: 'JetBrains Mono', size: 10.5 } }, grid: { display: false } },
+        y: { grid: { color: '#20293350' }, ticks: { color: '#6f7d8c', font: { family: 'JetBrains Mono', size: 10 }, callback: v => v + '%' } },
+      },
+    },
+  });
+}
+
+function renderTradeTable() {
+  const run = currentRun();
+  const wrap = document.getElementById('tradeTableWrap');
+  const countEl = document.getElementById('tradeCount');
+  if (!run || !run.trades.length) {
+    wrap.innerHTML = '<div class="empty">no trades triggered for this symbol / timeframe</div>';
+    countEl.textContent = '';
+    return;
+  }
+  const trades = [...run.trades].reverse();
+  countEl.textContent = `${run.metrics.num_trades} total`;
+  wrap.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Entry</th><th>Entry px</th><th>Exit</th><th>Exit px</th>
+        <th>Bars held</th><th>P&amp;L</th><th>Reason</th>
+      </tr></thead>
+      <tbody>
+        ${trades.slice(0, 60).map(t => `
+          <tr>
+            <td>${fmtDate(t.entry_date)}</td>
+            <td>${t.entry_price.toFixed(2)}</td>
+            <td>${fmtDate(t.exit_date)}</td>
+            <td>${t.exit_price.toFixed(2)}</td>
+            <td>${t.bars_held}</td>
+            <td class="${t.pnl_pct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtPct(t.pnl_pct)}</td>
+            <td><span class="reason ${t.exit_reason}">${t.exit_reason.replace('_', ' ')}</span></td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+    ${(trades.length > 60 || run.trades_capped) ? `<div class="footnote">showing most recent ${Math.min(60, trades.length)} of ${run.metrics.num_trades} — full history in <code>results/${run.symbol}_${run.timeframe}_trades.csv</code></div>` : ''}
+  `;
+}
+
+function renderFootnote() {
+  document.getElementById('footnote').innerHTML =
+    `strategy: long-only mean reversion — buy at lower Bollinger Band + RSI oversold while above the trend SMA, ` +
+    `sell at upper Bollinger Band, RSI overbought, ATR stop, or time stop. backtest, not investment advice.`;
+}
+
+function renderAll() {
+  renderControls();
+  renderRangeBanner();
+  renderStats();
+  renderPriceChart();
+  renderDiagnostics();
+  renderEquityChart();
+  renderCompareChart();
+  renderTradeTable();
+}
+
+function init() {
+  renderHeader();
+  renderFootnote();
+  STATE.timeframe = availableTimeframes()[0];
+  STATE.symbol = symbolsForTimeframe(STATE.timeframe)[0];
+  renderAll();
+}
+
+loadData();
+</script>
+</body>
+</html>
